@@ -1,0 +1,306 @@
+import { HexRoadGraph } from "../roads/HexRoadGraph.ts";
+import type { DirectedLane } from "../roads/HexRoadGraph.ts";
+import { CAR, TRUCK, idm } from "./idm.ts";
+export interface Vehicle {
+  id: number;
+  kind: "car" | "truck";
+  route: DirectedLane[];
+  laneIndex: number;
+  u: number;
+  speed: number;
+  length: number;
+  destination?: string;
+}
+export class TrafficSim {
+  vehicles: Vehicle[] = [];
+  time = 0;
+  income = 0;
+  deliveries = 0;
+  private serial = 0;
+  private conflictCache = new Map<string, boolean>();
+  private graphRevision = -1;
+  private waiting = new Map<number, { lane: string; since: number }>();
+  private graph: HexRoadGraph;
+  onDelivery?: (destination: string | undefined, reward: number) => void;
+  constructor(graph: HexRoadGraph) {
+    this.graph = graph;
+  }
+  spawn(
+    route: DirectedLane[],
+    kind: "car" | "truck",
+    destination?: string,
+  ): Vehicle | undefined {
+    if (
+      !route.length ||
+      route.some(
+        (l) => !this.graph.lanes.has(l.id) || !this.graph.movementAllowed(l),
+      )
+    )
+      return;
+    route = route.map((l) => this.graph.lanes.get(l.id)!);
+    const first = route[0];
+    if (this.vehicles.some((v) => v.route[v.laneIndex].nodeId === first.nodeId))
+      return;
+    const v: Vehicle = {
+      id: ++this.serial,
+      kind,
+      route,
+      laneIndex: 0,
+      u: 0,
+      speed: 0,
+      length: kind === "truck" ? 4.4 : 2.8,
+      destination,
+    };
+    this.vehicles.push(v);
+    return v;
+  }
+  cancelDestination(destination: string): void {
+    for (const v of this.vehicles)
+      if (v.destination === destination) this.waiting.delete(v.id);
+    this.vehicles = this.vehicles.filter((v) => v.destination !== destination);
+  }
+  sample(v: Vehicle) {
+    return v.route[v.laneIndex].sample(v.u);
+  }
+  travelled(v: Vehicle): number {
+    return (
+      v.route.slice(0, v.laneIndex).reduce((s, l) => s + l.length, 0) + v.u
+    );
+  }
+  get freeFlow(): number {
+    return this.vehicles.length
+      ? this.vehicles.reduce(
+          (s, v) =>
+            s +
+            Math.min(
+              1,
+              v.speed / (v.kind === "truck" ? TRUCK : CAR).desiredSpeed,
+            ),
+          0,
+        ) / this.vehicles.length
+      : 1;
+  }
+  step(dt: number): void {
+    if (!Number.isFinite(dt) || dt < 0 || dt > 10)
+      throw new RangeError("Simulation dt must be 0..10 seconds");
+    let remaining = dt;
+    while (remaining > 1e-9) {
+      const h = Math.min(1 / 30, remaining);
+      this.tick(h);
+      remaining -= h;
+    }
+  }
+  private conflicts(a: DirectedLane, b: DirectedLane): boolean {
+    if (a.nodeId !== b.nodeId) return false;
+    const key = [a.id, b.id].sort().join("|");
+    const cached = this.conflictCache.get(key);
+    if (cached !== undefined) return cached;
+    // Swept centerline envelopes. Opposing straight lanes are 2.3 m apart,
+    // wider than the 2.05 m envelope; crossing/merging paths reserve together.
+    for (let i = 0; i <= 24; i++) {
+      const p = a.sample((a.length * i) / 24).position;
+      for (let j = 0; j <= 24; j++) {
+        const q = b.sample((b.length * j) / 24).position;
+        if (Math.hypot(p.x - q.x, p.z - q.z) < 2.05) {
+          this.conflictCache.set(key, true);
+          return true;
+        }
+      }
+    }
+    this.conflictCache.set(key, false);
+    return false;
+  }
+  private tick(dt: number): void {
+    this.time += dt;
+    const changed = this.graphRevision !== this.graph.revision;
+    if (changed) {
+      this.graphRevision = this.graph.revision;
+      this.conflictCache.clear();
+    }
+    this.vehicles = this.vehicles.filter((v) =>
+      v.route.slice(v.laneIndex).every((l) => this.graph.lanes.has(l.id)),
+    );
+    if (changed)
+      for (const v of this.vehicles) {
+        const old = v.route[v.laneIndex],
+          fraction = v.u / old.length;
+        v.route = v.route.map((l, i) =>
+          i < v.laneIndex ? l : this.graph.lanes.get(l.id)!,
+        );
+        v.u = fraction * v.route[v.laneIndex].length;
+        if (
+          v.route
+            .slice(v.laneIndex + 1)
+            .some((l) => !this.graph.movementAllowed(l))
+        ) {
+          const current = v.route[v.laneIndex],
+            start = this.graph.nodes.get(current.nodeId)!,
+            target = this.graph.nodes.get(v.route.at(-1)!.nodeId)!;
+          const alternative = this.graph.route(start, target, current);
+          if (alternative.length) {
+            v.route = [...v.route.slice(0, v.laneIndex), ...alternative];
+          }
+        }
+      }
+    const states = this.vehicles.map((v) => ({ ...v }));
+    const owners = new Map<string, { id: number; lane: DirectedLane }[]>();
+    const reserve = (id: number, lane: DirectedLane) => {
+      const list = owners.get(lane.nodeId) ?? [];
+      if (!list.some((v) => v.id === id)) list.push({ id, lane });
+      owners.set(lane.nodeId, list);
+    };
+    const junction = (id: string) => this.graph.isJunction(id);
+    const controlled = (id: string) =>
+      junction(id) || !!this.graph.nodes.get(id)?.signal;
+    for (const v of states) {
+      const current = v.route[v.laneIndex];
+      if (controlled(current.nodeId)) reserve(v.id, current);
+      if (v.laneIndex > 0 && v.u < v.length / 2 + 0.5) {
+        const previous = v.route[v.laneIndex - 1];
+        if (controlled(previous.nodeId)) reserve(v.id, previous);
+      }
+    }
+    type Approach = {
+      id: number;
+      lane: DirectedLane;
+      distance: number;
+      since: number;
+    };
+    const approaches: Approach[] = [];
+    const present = new Set<number>();
+    for (const v of states) {
+      let distance = v.route[v.laneIndex].length - v.u;
+      for (let i = v.laneIndex + 1; i < v.route.length && distance <= 18; i++) {
+        const lane = v.route[i];
+        if (controlled(lane.nodeId)) {
+          const previous = this.waiting.get(v.id);
+          const wait =
+            previous?.lane === lane.id
+              ? previous
+              : { lane: lane.id, since: this.time };
+          this.waiting.set(v.id, wait);
+          present.add(v.id);
+          approaches.push({ id: v.id, lane, distance, since: wait.since });
+          break;
+        }
+        distance += lane.length;
+      }
+    }
+    for (const id of this.waiting.keys())
+      if (!present.has(id)) this.waiting.delete(id);
+    // Only the front vehicle of each entry competes; FIFO followers cannot reserve through it.
+    const fronts = approaches.filter(
+      (a) =>
+        !approaches.some(
+          (b) =>
+            b.id !== a.id &&
+            b.lane.nodeId === a.lane.nodeId &&
+            b.lane.inEdge === a.lane.inEdge &&
+            (b.distance < a.distance ||
+              (b.distance === a.distance && b.id < a.id)),
+        ),
+    );
+    let pending = fronts
+      .filter(
+        (a) =>
+          this.graph.isGreen(a.lane, this.time) &&
+          this.graph.movementAllowed(a.lane) &&
+          !(owners.get(a.lane.nodeId) ?? []).some(
+            (o) => o.id !== a.id && this.conflicts(a.lane, o.lane),
+          ),
+      )
+      .sort((a, b) => a.since - b.since || a.id - b.id);
+    const granted = new Set<number>();
+    while (pending.length) {
+      // Resolve priority before iteration order. A circular equal-priority wait uses arrival order.
+      const winner =
+        pending.find(
+          (a) =>
+            !pending.some(
+              (b) =>
+                a.id !== b.id &&
+                this.conflicts(a.lane, b.lane) &&
+                this.graph.mustYield(a.lane, b.lane),
+            ),
+        ) ?? pending[0];
+      granted.add(winner.id);
+      reserve(winner.id, winner.lane);
+      pending = pending.filter(
+        (a) => a.id !== winner.id && !this.conflicts(a.lane, winner.lane),
+      );
+    }
+    for (const v of this.vehicles) {
+      const lane = v.route[v.laneIndex];
+      let gap = Infinity,
+        leaderSpeed = 0,
+        travel = -v.u;
+      for (let i = v.laneIndex; i < v.route.length && travel < 90; i++) {
+        const ahead = v.route[i];
+        if (i > v.laneIndex) {
+          const blocked =
+            !this.graph.movementAllowed(ahead) ||
+            !this.graph.isGreen(ahead, this.time) ||
+            (controlled(ahead.nodeId) &&
+              ((travel <= 18 && !granted.has(v.id)) ||
+                (owners.get(ahead.nodeId) ?? []).some(
+                  (owner) =>
+                    owner.id !== v.id && this.conflicts(ahead, owner.lane),
+                )));
+          const stopDistance = travel - v.length / 2 - 0.6;
+          if (blocked && stopDistance < gap) {
+            gap = Math.max(0, stopDistance);
+            leaderSpeed = 0;
+          }
+        }
+        for (const other of states) {
+          if (other.id === v.id) continue;
+          const ol = other.route[other.laneIndex];
+          // Same exit corridor also detects a vehicle on a terminal half-lane.
+          if (ol.nodeId === ahead.nodeId) {
+            let front = Infinity;
+            if (ol.outEdge === ahead.outEdge)
+              front = travel + ahead.length - (ol.length - other.u);
+            else if (ol.inEdge >= 0 && ol.inEdge === ahead.inEdge)
+              front = travel + other.u;
+            const clearance = (other.length + v.length) / 2;
+            if (front > 0 && front - clearance < gap) {
+              gap = Math.max(0, front - clearance);
+              leaderSpeed = other.speed;
+            }
+          }
+        }
+        travel += ahead.length;
+      }
+      const params = v.kind === "truck" ? TRUCK : CAR;
+      const p = {
+        ...params,
+        desiredSpeed: Math.min(params.desiredSpeed, lane.speedLimit),
+      };
+      const acceleration = idm(
+        v.speed,
+        gap,
+        leaderSpeed,
+        p,
+        this.sample(v).grade,
+      );
+      const speed = Math.max(0, v.speed + acceleration * dt);
+      let move = (v.speed + speed) * 0.5 * dt;
+      // Hard non-penetration guard complements IDM under emergency close gaps.
+      move = Math.min(move, Math.max(0, gap - 0.1));
+      v.speed = move + 1e-8 < (v.speed + speed) * 0.5 * dt ? 0 : speed;
+      v.u += move;
+      while (v.u >= v.route[v.laneIndex].length) {
+        v.u -= v.route[v.laneIndex].length;
+        v.laneIndex++;
+        if (v.laneIndex === v.route.length) {
+          const reward = v.kind === "truck" ? 32 : 12;
+          this.deliveries++;
+          this.income += reward;
+          this.onDelivery?.(v.destination, reward);
+          break;
+        }
+      }
+    }
+    this.vehicles = this.vehicles.filter((v) => v.laneIndex < v.route.length);
+  }
+}
