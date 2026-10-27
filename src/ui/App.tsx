@@ -1,3 +1,4 @@
+import type { DistrictFootprintType } from "../core/districts/types.ts";
 import { HEIGHT_UNIT, RISE_PER_STEP } from "../core/hex/HeightUnits.ts";
 import { JunctionPanel } from "./JunctionPanel.tsx";
 import type { RoadAddress } from "../core/roads/HexRoadGraph.ts";
@@ -29,12 +30,16 @@ export function App() {
     [level, setLevel] = useState<Level>("ground"),
     [direction, setDirection] = useState(0),
     [span, setSpan] = useState(3),
+    [shopFootprint, setShopFootprint] = useState<DistrictFootprintType>("single"),
+    [warehouseFootprint, setWarehouseFootprint] = useState<DistrictFootprintType>("triad_3"),
     [rampTarget, setRampTarget] = useState<Level>("elevated"),
     [paper, setPaper] = useState(false),
     [hover, setHover] = useState("—"),
     [selected, setSelected] = useState<RoadAddress | undefined>(),
     [seed, setSeed] = useState("23"),
     [error, setError] = useState("");
+  const footprint: DistrictFootprintType = tool === "Shop" ? shopFootprint : tool === "Warehouse" ? warehouseFootprint : tool === "Factory" ? "superhex_7" : "single";
+  const building = ["Home", "Shop", "Warehouse", "Factory"].includes(tool);
   useEffect(() => {
     try {
       scene.current = new IsoScene(host.current!, game);
@@ -66,10 +71,11 @@ export function App() {
         span,
         paper,
         rampTarget,
+        footprint,
       };
       scene.current.preview();
     }
-  }, [tool, level, direction, span, paper, rampTarget, game]);
+  }, [tool, level, direction, span, paper, rampTarget, footprint, game]);
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement).matches("input,select,textarea")) return;
@@ -170,6 +176,32 @@ export function App() {
             Эстакада
           </button>
         </fieldset>
+        {building && (
+          <div className="ramp-settings">
+            <label>
+              Размер предприятия
+              <select
+                aria-label="Размер предприятия"
+                value={footprint}
+                disabled={tool === "Home" || tool === "Factory"}
+                onChange={e => (tool === "Shop" ? setShopFootprint : setWarehouseFootprint)(e.target.value as DistrictFootprintType)}
+              >
+                {(tool === "Home" || tool === "Shop") && <option value="single">1 гекс</option>}
+                {(tool === "Shop" || tool === "Warehouse") && <option value="triad_3">3 гекса · триада</option>}
+                {(tool === "Warehouse" || tool === "Factory") && <option value="superhex_7">7 гексов · комплекс</option>}
+              </select>
+            </label>
+            {footprint !== "single" && <label>
+              Ориентация ворот
+              <select aria-label="Ориентация предприятия" value={direction} onChange={e => setDirection(Number(e.target.value))}>
+                {[0, 1, 2, 3, 4, 5].map(n => <option key={n} value={n}>{n * 60}°</option>)}
+              </select>
+            </label>}
+            <p className="junction-note">
+              {footprint === "single" ? "Один свободный гекс." : "Зелёная стрелка — въезд IN, оранжевая — выезд OUT. Подведите дороги к обоим воротам. Планировка: +150 Cr за изменённый гекс."}
+            </p>
+          </div>
+        )}
         {tool === "ramp" && (
           <div className="ramp-settings">
             <label>
@@ -233,7 +265,7 @@ export function App() {
               : tool === "ramp"
                 ? "Кликните наземный конец. Подключение — только с торцов."
                 : tool === "demolish"
-                  ? "Удаляется выбранный уровень. Рампа удаляется целиком."
+                  ? "Удаляется выбранный уровень. Рампа и предприятие удаляются целиком."
                   : tool === "inspect"
                     ? "Щелчок по дороге — правила перекрёстка. WASD / ПКМ — перемещение."
                     : "Кликните гекс для размещения."}

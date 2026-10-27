@@ -645,8 +645,14 @@ export class HexRoadGraph {
       ? this.lanesAt(l.nextNode).filter((n) => n.inEdge === opposite(l.outEdge))
       : [];
   }
-  /** A* over actual lane endpoints. Service yards are available only to their own trips. */
-  /** A* over actual lane endpoints. Service yards are available only to their own trips. */
+  /** Query the directed courtyard; reverse entry is never an allowed movement. */
+  serviceRoute(serviceId: string, from: "IN" | "OUT", to: "IN" | "OUT"): DirectedLane[] | null {
+    if(from!=="IN" || to!=="OUT") return null;
+    const start=this.lanes.get(`yard:${serviceId}:IN`), end=this.lanes.get(`yard:${serviceId}:OUT`);
+    if(!start || !end) return null;
+    const path=this.routeLanes([start],[end.id],new Set([serviceId]));
+    return path.length ? path : null;
+  }
   routeLanes(starts: DirectedLane[], targets: string[], allowedServices = new Set<string>()): DirectedLane[] {
     const goal = new Set(targets), open = new Set<string>(), cost = new Map<string, number>(), prev = new Map<string, string>();
     const targetPoints = targets.map(id => this.lanes.get(id)).filter((l): l is DirectedLane => !!l).map(l => l.sample(l.length).position);

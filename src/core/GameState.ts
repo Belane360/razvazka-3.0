@@ -1,3 +1,4 @@
+import type { DistrictFootprintType, LogisticsConfig } from "./districts/types.ts";
 import { HEIGHT_UNIT } from "./hex/HeightUnits.ts";
 import { hexToWorld } from "./hex/HexCoords.ts";
 import { HexMap } from "./hex/HexMap.ts";
@@ -33,8 +34,9 @@ export class GameState {
   private nextSpawn = 0;
   private trip = 0;
   private earnings: { t: number; amount: number }[] = [];
-  constructor(seed = 23) {
+  constructor(seed = 23, config: Partial<LogisticsConfig> = {}) {
     this.map = new HexMap(14, seed);
+    this.sim.reset(config);
     const path = (cells: Hex[], level: Level = "ground") => {
       for (const h of cells) this.roads.addRoad({ ...h, level });
       for (let i = 1;i < cells.length;i++)
@@ -67,13 +69,15 @@ export class GameState {
       [-4, 1, "Home"],
       [-5, 1, "Home"],
       [-3, -1, "Home"],
-      [3, -1, "Factory"],
-      [4, -1, "Factory"],
+      [4, -3, "Factory"],
       [1, -4, "Warehouse"],
       [-1, 4, "Shop"],
       [5, 1, "Shop"],
     ] as [number, number, ZoneType][])
       this.districts.place({ q, r }, type);
+    path([{q:2,r:0},{q:2,r:-1},{q:2,r:-2},{q:2,r:-3},{q:3,r:-4}]);
+    path([{q:6,r:0},{q:6,r:-1},{q:6,r:-2},{q:6,r:-3}]);
+    this.roads.configureJunction({q:2,r:-3,level:"ground"}, {allowLeft:true});
     this.sim.onDelivery = (destination, reward) => {
       this.budget += reward;
       this.earnings.push({ t: this.sim.time, amount: reward });
@@ -113,25 +117,19 @@ export class GameState {
     this.earnings = this.earnings.filter((e) => this.sim.time - e.t < 30);
   }
   private dispatch(): void {
-    if (this.sim.vehicles.length >= 80)
+    if (this.sim.vehicles.filter(v => v.kind === "car").length >= 12)
       return;
-    const zones = [...this.districts.zones.values()];
+    const zones = [...this.districts.facilities.values()].filter(f => f.type === "home" || f.type === "shop").map(f => this.districts.zones.get(hexKey(f.center))!);
     if (zones.length < 2)
       return;
     for (let attempt = 0;attempt < zones.length;attempt++) {
       const source = zones[this.trip++ % zones.length];
-      const targetType = source.type === "Factory"
-        ? "Warehouse"
-        : source.type === "Warehouse"
-          ? "Shop"
-          : source.type === "Home"
-            ? "Shop"
-            : "Home";
+      const targetType = source.type === "Home" ? "Shop" : "Home";
       const targets = zones.filter((z) => z.type === targetType);
       if (!targets.length)
         continue;
       const dest = targets[Math.floor(this.trip / zones.length) % targets.length];
-      if (this.sim.spawnTrip(source, dest, source.type === "Factory" || source.type === "Warehouse" ? "truck" : "car"))
+      if (this.sim.spawnTrip(source, dest, "car"))
         return;
     }
   }
@@ -182,6 +180,7 @@ export class GameState {
     span: number,
     previous?: Hex,
     rampTarget: Level = "elevated",
+    footprint?: DistrictFootprintType,
   ): boolean {
     if (tool === "inspect") return false;
     try {
@@ -262,15 +261,12 @@ export class GameState {
         if (this.roads.get({ ...h, level }))
           this.roads.removeRoad({ ...h, level });
         else if (level === "ground" && this.districts.zones.has(hexKey(h))) {
-          const old = this.districts.clusterAt(h)!;
-          const survivor = this.districts.remove(h);
-          if (survivor) this.sim.degradeDistrict(old, survivor);
-          else this.sim.cancelDestination(hexKey(h));
+          this.districts.remove(h);
         } else return false;
       } else {
         if (tile.biome === "water")
           throw new Error("Район нельзя разместить на воде");
-        cost += this.districts.place(h, tool, this.budget - cost);
+        cost += this.districts.place(h, tool, this.budget - cost, footprint, direction);
       }
       this.sim.reconcileRoutes();
       this.budget -= cost;

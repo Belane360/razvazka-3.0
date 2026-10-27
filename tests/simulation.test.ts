@@ -14,14 +14,14 @@ const line = () => {
   for (let q = 0; q < 7; q++) g.addRoad(n(q));
   return g;
 };
-test("zones cluster and connect only to adjacent ground roads", () => {
+test("homes remain separate and connect only to adjacent ground roads", () => {
   const g = new HexRoadGraph();
   g.addRoad(n(0, 0, "elevated"));
   const d = new DistrictManager(g);
   d.place({ q: 0, r: 1 }, "Home");
   d.place({ q: 1, r: 1 }, "Home");
-  assert.equal(d.clusters.length, 1);
-  assert.equal(d.clusters[0].tiles.length, 2);
+  assert.equal(d.clusters.length, 2);
+  assert.equal(d.clusters[0].tiles.length, 1);
   assert.equal(d.access({ q: 0, r: 1 }).length, 0);
   g.addRoad(n(0));
   assert.equal(d.access({ q: 0, r: 1 }).length, 1);

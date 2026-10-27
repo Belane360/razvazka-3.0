@@ -1,3 +1,6 @@
+import { defaultFootprint, facilityFootprint } from "../core/districts/DistrictManager.ts";
+import type { ZoneType } from "../core/districts/DistrictManager.ts";
+import type { DistrictFootprintType } from "../core/districts/types.ts";
 import { RISE_PER_STEP } from "../core/hex/HeightUnits.ts";
 import * as THREE from "three";
 import { HexMeshBuilder, disposeGroup } from "./HexMeshBuilder.ts";
@@ -20,6 +23,7 @@ export interface SceneOptions {
   span: number;
   rampTarget: Level;
   paper: boolean;
+  footprint?: DistrictFootprintType;
 }
 export class IsoScene {
   readonly renderer: THREE.WebGLRenderer;
@@ -221,6 +225,7 @@ export class IsoScene {
         this.options.span,
         drawing ? this.stroke : undefined,
         this.options.rampTarget,
+        this.options.footprint,
       );
       const exists = this.game.roads.get({
         ...h,
@@ -243,12 +248,33 @@ export class IsoScene {
       return;
     }
     this.ghost.visible = true;
-    let h = { ...this.hover };
-    for (
-      let i = 0;
-      i <= (this.options.tool === "ramp" ? this.options.span : 0);
-      i++
-    ) {
+    const building = ["Home", "Shop", "Warehouse", "Factory"].includes(this.options.tool);
+    const footprint = this.options.footprint ?? (building ? defaultFootprint(this.options.tool as ZoneType) : "single");
+    let cells: Hex[] = building
+      ? facilityFootprint(this.hover, footprint, this.options.direction)
+      : [this.hover];
+    if (this.options.tool === "ramp") {
+      for (let i = 0; i < this.options.span; i++) cells.push(neighbor(cells.at(-1)!, this.options.direction));
+    } else if (this.options.tool === "demolish" && this.options.level === "ground") {
+      cells = this.game.districts.facilityAt(this.hover)?.tiles ?? cells;
+    }
+    const base = this.game.map.height(this.hover);
+    let valid = true, cost = 120;
+    if (building) {
+      for (const cell of cells) {
+        const tile = this.game.map.get(cell);
+        if (!tile || tile.biome === "water" || tile.occupiedBy ||
+          this.game.roads.get({...cell, level:"ground"}) || this.game.roads.get({...cell, level:"elevated"}) ||
+          Math.abs(this.game.map.height(cell) - base) > 6) valid = false;
+        if (Math.abs(this.game.map.height(cell) - base) > 1e-8) cost += 150;
+        for (let edge = 0; edge < 6; edge++) {
+          const next = neighbor(cell, edge);
+          if (cells.some(c => hexKey(c) === hexKey(next)) && Math.abs(this.game.map.height(cell) - this.game.map.height(next)) > 6) valid = false;
+        }
+      }
+      if (this.game.budget < cost) valid = false;
+    }
+    for (const [i, h] of cells.entries()) {
       const tile = this.game.map.get(h);
       const pos = hexToWorld(h.q, h.r, this.game.map.height(h));
       const high =
@@ -256,13 +282,13 @@ export class IsoScene {
       const m = new THREE.Mesh(
         new THREE.CylinderGeometry(9.5, 9.5, 0.22, 6),
         new THREE.MeshBasicMaterial({
-          color: tile ? 0xf7e6a4 : 0xd94c40,
+          color: tile && valid ? 0xf7e6a4 : 0xd94c40,
           transparent: true,
           opacity: 0.48,
           depthWrite: false,
         }),
       );
-      let y = pos.y;
+      let y = building && footprint !== "single" ? base : pos.y;
       if (this.options.tool === "ramp") {
         let end = { ...this.hover };
         for (let j = 0; j < this.options.span; j++)
@@ -274,14 +300,39 @@ export class IsoScene {
               : low + this.options.span * RISE_PER_STEP,
           t = i / this.options.span;
         y = low + (top - low) * t * t * (3 - 2 * t);
-      } else if (high)
+      } else if (high && !building)
         y = this.game.roads.proposedHeight(
           { ...h, level: "elevated" },
           this.stroke ? { ...this.stroke, level: "elevated" } : undefined,
         );
       m.position.set(pos.x, y + 0.6, pos.z);
       this.ghost.add(m);
-      h = neighbor(h, this.options.direction);
+    }
+    if (building && footprint !== "single") {
+      const angle = this.options.direction * Math.PI / 3;
+      const axis = { x: Math.cos(angle), z: Math.sin(angle) };
+      for (const input of [true, false]) {
+        const edge = (this.options.direction + (input ? 3 : 0)) % 6;
+        const gates = cells.filter(cell => !cells.some(c => hexKey(c) === hexKey(neighbor(cell, edge))))
+          .map(cell => {
+            const a = hexToWorld(cell.q, cell.r), n = neighbor(cell, edge), b = hexToWorld(n.q, n.r);
+            return { x: (a.x + b.x) / 2, z: (a.z + b.z) / 2 };
+          }).sort((a, b) => (input ? 1 : -1) * ((a.x - b.x) * axis.x + (a.z - b.z) * axis.z));
+        const gate = gates[0];
+        const arrow = new THREE.Shape();
+        arrow.moveTo(-2.8, -0.7); arrow.lineTo(0, -0.7);
+        arrow.lineTo(0, -1.8); arrow.lineTo(3, 0); arrow.lineTo(0, 1.8);
+        arrow.lineTo(0, 0.7); arrow.lineTo(-2.8, 0.7); arrow.closePath();
+        const geometry = new THREE.ShapeGeometry(arrow);
+        geometry.rotateX(-Math.PI / 2);
+        const marker = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
+          color: input ? 0x168958 : 0xe06b29, side: THREE.DoubleSide, depthTest: false,
+        }));
+        marker.rotation.y = -angle;
+        marker.position.set(gate.x, base + 0.85, gate.z);
+        marker.renderOrder = 2;
+        this.ghost.add(marker);
+      }
     }
   }
   private animate = (now: number) => {

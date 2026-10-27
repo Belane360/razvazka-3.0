@@ -12,6 +12,7 @@ import { edgeDirection, laneGeometry } from "../core/roads/geometry.ts";
 import { complexLayout } from "../core/districts/ServiceYard.ts";
 import type { DistrictCluster } from "../core/districts/DistrictManager.ts";
 import type { Zone } from "../core/districts/DistrictManager.ts";
+type RenderState = Pick<GameState, "map" | "roads" | "districts" | "terrainAt">;
 export const PALETTE = {
   grass: 0x5cd68d,
   side: 0x3fa368,
@@ -146,14 +147,14 @@ export class HexMeshBuilder {
   readonly root = new THREE.Group();
   readonly pickables: THREE.Object3D[] = [];
   readonly signals: { mesh: THREE.Mesh; nodeId: string; edge: number }[] = [];
-  build(game: GameState, paper = false): void {
+  build(game: RenderState, paper = false): void {
     disposeGroup(this.root);
     this.pickables.length = 0;
     this.signals.length = 0;
     const treePositions: THREE.Vector3[] = [];
     const clusters = game.districts.clusters;
-    const duos = new Map<string, DistrictCluster>();
-    for (const c of clusters) if (c.shape === "duo") for (const t of c.tiles) duos.set(hexKey(t), c);
+    const complexes = new Map<string, DistrictCluster>();
+    for (const c of clusters) if (c.shape !== "single") for (const t of c.tiles) complexes.set(hexKey(t), c);
     for (const t of game.map.tiles.values()) {
       const p = hexToWorld(t.q, t.r, game.map.height(t));
       const water = t.biome === "water";
@@ -221,8 +222,8 @@ export class HexMeshBuilder {
       const outline: number[] = [];
       for (let e = 0;e < 6;e++) {
         // Outline index e spans the actual neighbor edge e+1.
-        const c = duos.get(hexKey(t));
-        if (c && c === duos.get(hexKey(neighbor(t, (e + 1) % 6)))) continue;
+        const c = complexes.get(hexKey(t));
+        if (c && c === complexes.get(hexKey(neighbor(t, (e + 1) % 6)))) continue;
         for (let i = 0;i < 10;i++)
           for (const u of [i / 10, (i + 1) / 10]) {
             const a = ((e + 0.5) * Math.PI) / 3,
@@ -245,7 +246,7 @@ export class HexMeshBuilder {
       for (let edge = 0;edge < 6;edge++) {
         const adjacent = game.map.get(neighbor(t, edge));
         const engineered = game.map.flattened.has(hexKey(t));
-        const sameComplex = duos.has(hexKey(t)) && duos.get(hexKey(t)) === duos.get(hexKey(neighbor(t, edge)));
+        const sameComplex = complexes.has(hexKey(t)) && complexes.get(hexKey(t)) === complexes.get(hexKey(neighbor(t, edge)));
         if (sameComplex) continue;
         if (!engineered && adjacent &&
           (game.map.flattened.has(hexKey(adjacent)) || !game.map.isCliff(t, edge) || game.map.height(t) <= game.map.height(adjacent))) continue;
@@ -354,8 +355,8 @@ export class HexMeshBuilder {
       this.road(game, { ...n, connectionsMask }, paper);
     }
     for (const z of game.districts.zones.values())
-      if (!duos.has(hexKey(z))) this.building(game, z, paper);
-    for (const c of clusters) if (c.shape === "duo") this.complex(game, c, paper);
+      if (!complexes.has(hexKey(z))) this.building(game, z, paper);
+    for (const c of clusters) if (c.shape !== "single") this.complex(game, c, paper);
   }
   private deckBody(top: THREE.BufferGeometry): void {
     const pos = top.getAttribute("position"),
@@ -391,7 +392,7 @@ export class HexMeshBuilder {
     body.receiveShadow = true;
     this.root.add(body);
   }
-  private road(game: GameState, n: RoadCell, paper: boolean): void {
+  private road(game: RenderState, n: RoadCell, paper: boolean): void {
     const p = hexToWorld(n.q, n.r);
     const asphalt = paper ? 0x5a5c54 : PALETTE.asphalt;
     const isJunction =
@@ -556,7 +557,7 @@ export class HexMeshBuilder {
     }
   }
   private curvedRoad(
-    game: GameState,
+    game: RenderState,
     n: RoadCell,
     edges: number[],
     color: number,
@@ -718,7 +719,7 @@ export class HexMeshBuilder {
         this.signals.push({ mesh: light, nodeId: n.id, edge: e });
       }
   }
-  private complex(game: GameState, cluster: DistrictCluster, paper: boolean): void {
+  private complex(game: RenderState, cluster: DistrictCluster, paper: boolean): void {
     const elevation = game.map.height(cluster.tiles[0]);
     const layout = complexLayout(cluster, elevation);
     const group = new THREE.Group();
@@ -742,52 +743,65 @@ export class HexMeshBuilder {
     apron.name = `apron:${cluster.id}`;
     apron.receiveShadow = true;
     this.root.add(apron);
-    const warehouse = cluster.type === "Warehouse";
-    box(group, 24, 4.5, 5, 0, 2.5, -1.9, warehouse ? 0xe5ae62 : PALETTE.concrete);
-    if (warehouse) {
-      // Two continuous roof planes, with standing seams running across their slope.
+    const warehouse = cluster.type === "Warehouse", shop = cluster.type === "Shop";
+    const large = cluster.shape === "superhex_7";
+    const width = large ? 32 : 14, depth = large ? 13 : 7;
+    const height = large ? 9 : 6.5, centerZ = large ? -6.5 : -2;
+    const front = centerZ + depth / 2;
+    const body = box(group, width, height, depth, 0, height / 2 + 0.25, centerZ,
+      warehouse ? 0xe5ae62 : shop ? 0xeedcb9 : PALETTE.concrete);
+    body.name = `body:${cluster.id}`;
+    if (shop) {
+      box(group, width + 0.4, 0.45, depth + 0.4, 0, height + 0.45, centerZ, 0x3aafa9);
+      for (let i = 0; i < 6; i++) {
+        const x = -5.5 + i * 2.2;
+        box(group, 1.9, 3.2, 0.15, x, 2.3, front + 0.1, 0x96c8d8).name = `shopfront:${i}`;
+        box(group, 2.1, 0.22, 1.5, x, 4.1, front + 0.6, i % 2 ? PALETTE.paper : PALETTE.accent);
+      }
+    } else if (warehouse) {
+      const slope = 0.22, half = depth / 2 + 0.3, ridge = height + 0.35 + Math.tan(slope) * half;
       for (const side of [-1, 1]) {
-        const roof = box(group, 24.7, 0.18, 2.85, 0, 5.05, -1.9 + side * 1.35, PALETTE.asphalt);
-        roof.rotation.x = side * 0.24;
-        for (let x = -12;x <= 12;x += 1.2) {
-          const seam = box(group, 0.055, 0.09, 2.85, x, 5.17, -1.9 + side * 1.35, 0x666575);
-          seam.rotation.x = side * 0.24;
+        const y = ridge - Math.tan(slope) * half / 2, z = centerZ + side * half / 2;
+        const roof = box(group, width + 0.7, 0.18, half / Math.cos(slope), 0, y, z, PALETTE.asphalt);
+        roof.name = `roof:${cluster.id}:${side}`;
+        roof.rotation.x = side * slope;
+        for (let x = -width / 2; x <= width / 2; x += 1.25) {
+          const seam = box(group, 0.055, 0.08, half / Math.cos(slope), x, y + 0.13, z, 0x666575);
+          seam.rotation.x = side * slope;
+        }
+        for (const x of [-width / 3, 0, width / 3]) {
+          const skylight = box(group, 2.4, 0.12, half * 0.45, x, y + 0.22, z, 0x96c8d8);
+          skylight.rotation.x = side * slope;
+          skylight.name = `skylight:${cluster.id}:${x}:${side}`;
         }
       }
-    }
-    else {
-      for (let i = 0;i < 4;i++) {
+    } else {
+      const shedWidth = width / 4;
+      for (let i = 0; i < 4; i++) {
         const shape = new THREE.Shape();
-        shape.moveTo(-3, 0);
-        shape.lineTo(3, 0);
-        shape.lineTo(3, 1.6);
-        shape.closePath();
-        const roof = new THREE.Mesh(new THREE.ExtrudeGeometry(shape, { depth: 5.5, bevelEnabled: false }), material(PALETTE.asphalt));
+        shape.moveTo(0, 0); shape.lineTo(shedWidth, 0); shape.lineTo(shedWidth, 2); shape.closePath();
+        const roof = new THREE.Mesh(new THREE.ExtrudeGeometry(shape, { depth: depth + 0.5, bevelEnabled: false }), material(PALETTE.asphalt));
         roof.name = `shed:${cluster.id}:${i}`;
-        roof.position.set(-9 + i * 6, 4.7, -4.65);
-        roof.castShadow = true;
-        group.add(roof);
+        roof.position.set(-width / 2 + i * shedWidth, height + 0.25, centerZ - depth / 2 - 0.25);
+        roof.castShadow = true; group.add(roof);
+        box(group, 0.12, 1.1, depth * 0.7, -width / 2 + (i + 1) * shedWidth + 0.03, height + 1.4, centerZ, 0x96c8d8);
       }
-      for (const x of [-2.1, 0, 2.1]) {
-        cylinder(group, 0.48, 0.65, 5.4, x, 7, -3, 0xb86544, 8);
-        cylinder(group, 0.57, 0.57, 0.45, x, 9.7, -3, PALETTE.paper, 8);
+      for (const [i, x] of [-3, 0, 3].entries()) {
+        const stackHeight = 16 + i;
+        cylinder(group, 0.65, 0.9, stackHeight, x, stackHeight / 2 + 0.25, centerZ - 2, 0xb86544, 12).name = `stack:${cluster.id}:${i}`;
+        cylinder(group, 0.78, 0.78, 0.6, x, stackHeight, centerZ - 2, PALETTE.paper, 12);
       }
     }
-    for (let i = 0;i < 4;i++) {
-      const x = -9 + i * 6;
-      const dock = box(group, 2.6, 2.9, 0.18, x, 1.75, 0.64, 0x272d31);
+    if (!shop) for (let i = 0, count = large ? 6 : 4; i < count; i++) {
+      const x = (i - (count - 1) / 2) * (width - 5) / (count - 1);
+      const dock = box(group, 2.8, 3.8, 0.22, x, 2.15, front + 0.15, 0x272d31);
       dock.name = `dock:${cluster.id}:${i}`;
-      box(group, 2.95, 0.22, 1.1, x, 0.4, 1, PALETTE.concrete);
-      for (const dx of [-1.55, 1.55])
-        box(group, 0.13, 0.035, 2, x + dx, 0.265, 1.7, PALETTE.mark);
-      box(group, 1.25, 0.85, 1.15, x + 2, 0.7, -4.9, 0xb88a52);
-    }
-    for (const x of [-7, 0, 7]) {
-      // Painted arrows make the direction of the service yard visible.
-      box(group, 1.4, 0.025, 0.12, x, 0.275, 3.5, PALETTE.mark);
-      for (const sign of [-1, 1]) {
-        const arrow = box(group, 0.65, 0.025, 0.12, x + 0.55, 0.275, 3.5 + sign * 0.2, PALETTE.mark);
-        arrow.rotation.y = sign * 0.65;
+      box(group, 3.3, 0.22, 1.2, x, 0.4, front + 0.6, PALETTE.concrete);
+      box(group, 3.5, 0.22, 1.7, x, 4.2, front + 0.7, warehouse ? PALETTE.accent : 0x747a70);
+      for (const dx of [-1.65, 1.65]) {
+        box(group, 0.13, 0.035, 4.2, x + dx, 0.265, front + 2.3, 0xe3bb53);
+        cylinder(group, 0.17, 0.17, 1.2, x + dx, 0.85, front + 0.6, 0xe3bb53, 8);
+        cylinder(group, 0.18, 0.18, 0.3, x + dx, 1.05, front + 0.6, PALETTE.ink, 8);
       }
     }
     // Draw the very same sampled access paths that the simulator uses.
@@ -812,9 +826,15 @@ export class HexMeshBuilder {
         strip.name = `service:${lane.id}`;
         strip.receiveShadow = true;
         this.root.add(strip);
-        if (lane.servicePart === "connector" && (lane.inEdge === -1 || lane.outEdge === -1)) {
+        if (lane.servicePart === "yard") for (let u = 1.5; u < lane.length - 0.8; u += 3.5) {
+          const sample = lane.sample(u), mark = box(this.root, 0.12, 0.025, 1.4,
+            sample.position.x, sample.position.y + 0.22, sample.position.z, PALETTE.mark);
+          mark.rotation.y = Math.atan2(sample.tangent.x, sample.tangent.z);
+        }
+        if (lane.servicePart === "yard" || (lane.inEdge === -1 || lane.outEdge === -1)) {
           const sample = lane.sample(lane.length * 0.65), arrow = new THREE.Group();
-          arrow.position.set(sample.position.x, sample.position.y + 0.22, sample.position.z);
+          arrow.name = `direction:${lane.id}`;
+          arrow.position.set(sample.position.x, sample.position.y + 0.24, sample.position.z);
           arrow.rotation.y = Math.atan2(sample.tangent.x, sample.tangent.z);
           box(arrow, 0.13, 0.025, 1.3, 0, 0, 0, PALETTE.mark);
           for (const sign of [-1, 1]) {
@@ -825,7 +845,7 @@ export class HexMeshBuilder {
         }
       }
   }
-  private building(game: GameState, z: Zone, paper: boolean): void {
+  private building(game: RenderState, z: Zone, paper: boolean): void {
     const p = hexToWorld(z.q, z.r, game.map.height(z));
     const footprint = Array.from({ length: 24 }, (_, i) =>
       game.map.surfaceAt(

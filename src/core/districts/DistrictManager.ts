@@ -1,238 +1,142 @@
-import { hexKey, neighbor, hexToWorld, HEX_STEP, distance } from "../hex/HexCoords.ts";
-import type { Hex } from "../hex/HexCoords.ts";
-import { HexRoadGraph } from "../roads/HexRoadGraph.ts";
-import { serviceNetwork } from "./ServiceYard.ts";
-import type { DirectedLane } from "../roads/HexRoadGraph.ts";
-import type { RoadAddress } from "../roads/HexRoadGraph.ts";
-import type { HexMap } from "../hex/HexMap.ts";
-export type ZoneType = "Home" | "Shop" | "Factory" | "Warehouse";
-export interface Zone extends Hex {
-  type: ZoneType;
-  progress: number;
-  accessEdge?: number;
-}
-export interface DistrictEdge {
-  tile: Hex;
-  edge: number;
-  road?: RoadAddress;
-}
-export interface AccessPort extends DistrictEdge {
-  role: "IN" | "OUT";
-  road: RoadAddress;
-}
+import { hexKey, neighbor, neighbors, hexToWorld, distance } from '../hex/HexCoords.ts';
+import type { Hex } from '../hex/HexCoords.ts';
+import { HexRoadGraph } from '../roads/HexRoadGraph.ts';
+import type { DirectedLane, RoadAddress } from '../roads/HexRoadGraph.ts';
+import type { HexMap } from '../hex/HexMap.ts';
+import { serviceNetwork } from './ServiceYard.ts';
+import { logisticsConfig } from './types.ts';
+import type { DistrictFacility, DistrictFootprintType, FacilityGate, LogisticsConfig } from './types.ts';
+export type ZoneType = 'Home' | 'Shop' | 'Factory' | 'Warehouse';
+export interface Zone extends Hex { type: ZoneType; progress: number; facilityId: string; accessEdge?: number }
+export interface DistrictEdge { tile: Hex; edge: number; road?: RoadAddress }
+export interface AccessPort extends DistrictEdge { role: 'IN' | 'OUT'; road: RoadAddress }
 export interface DistrictCluster {
-  shape: "single" | "duo";
-  sharedEdge?: DistrictEdge;
-  externalEdges: DistrictEdge[];
-  ports: {
-    IN?: AccessPort;
-    OUT?: AccessPort;
-  };
-  id: string;
-  type: ZoneType;
-  tiles: Zone[];
-  level: number;
-  progress: number;
+  id: string; type: ZoneType; shape: DistrictFootprintType; center: Hex; direction: number;
+  tiles: Zone[]; level: number; progress: number; externalEdges: DistrictEdge[];
+  ports: { IN?: AccessPort; OUT?: AccessPort };
+}
+const forms: Record<ZoneType, DistrictFootprintType[]> = {
+  Home:['single'], Shop:['single','triad_3'], Warehouse:['triad_3','superhex_7'], Factory:['superhex_7'],
+};
+export function defaultFootprint(type: ZoneType): DistrictFootprintType { return forms[type][0]; }
+export function facilityFootprint(center: Hex, footprint: DistrictFootprintType, direction=0): Hex[] {
+  if (!Number.isInteger(direction) || direction<0 || direction>5) throw new RangeError('Direction must be 0..5');
+  if(footprint==='single') return [{...center}];
+  if(footprint==='triad_3') return [{...center},neighbor(center,direction),neighbor(center,(direction+1)%6)];
+  if(footprint==='superhex_7') return [{...center},...neighbors(center)];
+  throw new RangeError('Unknown footprint');
 }
 export class DistrictManager {
-  readonly zones = new Map<string, Zone>();
+  readonly zones = new Map<string,Zone>();
+  readonly facilities = new Map<string,DistrictFacility>();
+  readonly occupiedBy = new Map<string,string>();
+  revision=0;
+  config: LogisticsConfig;
+  onFacilityRemoved?: (facility:DistrictFacility)=>void;
+  private serial=0;
   private graph: HexRoadGraph;
-  private terrain?: () => HexMap;
-  private pairs = new Map<string, string>();
-  revision = 0;
-  constructor(graph: HexRoadGraph, terrain?: () => HexMap) {
-    this.graph = graph;
-    this.terrain = terrain;
-    graph.onRoadChange = () => this.syncNetwork();
+  private terrain?: ()=>HexMap;
+  constructor(graph:HexRoadGraph,terrain?:()=>HexMap,config:Partial<LogisticsConfig>={}) {
+    this.graph=graph;this.terrain=terrain;this.config=logisticsConfig(config);
+    graph.onRoadChange=()=>this.syncNetwork();
   }
-  private mergeBase(h: Hex, type: ZoneType): Zone | undefined {
-    if (type !== "Warehouse" && type !== "Factory")
-      return;
-    // Insertion order determines the base, never a later BFS or road rebuild.
-    return [...this.zones.values()].find(z => z.type === type &&
-      !this.pairs.has(hexKey(z)) && ![...this.pairs.values()].includes(hexKey(z)) &&
-      Array.from({ length: 6 }, (_, e) => hexKey(neighbor(z, e))).includes(hexKey(h)) &&
-      Math.abs((this.terrain?.().height(z) ?? 0) - (this.terrain?.().height(h) ?? 0)) <= 6);
+  private newState(type:ZoneType): DistrictFacility['state'] {
+    const c=this.config;
+    if(type==='Shop')return {stock:c.shopMaxStock,maxStock:c.shopMaxStock,inFlightTrucks:0,consumptionTimer:0};
+    if(type==='Warehouse')return {stock:0,capacity:c.warehouseCapacity,reservedStock:0,incomingTrucks:0};
+    if(type==='Factory')return {productionBuffer:0,bufferLimit:c.factoryBufferLimit,productionTimer:0,productionRateSec:c.factoryProductionRateSec};
+    return {};
   }
-  place(h: Hex, type: ZoneType, available = Infinity): number {
-    if (this.graph.get({ ...h, level: "ground" }) ||
-      this.graph.get({ ...h, level: "elevated" }))
-      throw new Error("Гекс занят дорогой");
-    if (this.zones.has(hexKey(h)))
-      throw new Error("Зона уже существует");
-    const base = this.mergeBase(h, type), map = this.terrain?.();
-    const cost = base && map && Math.abs(map.height(base) - map.height(h)) > 1e-8 ? 150 : 0;
-    if (available < cost)
-      throw new Error("Недостаточно средств для земляных работ (+150 Cr)");
-    this.zones.set(hexKey(h), { ...h, type, progress: 0 });
-    if (base) {
-      this.pairs.set(hexKey(base), hexKey(h));
-      map?.flatten([base, h], map.height(base));
+  resetLogistics(config:Partial<LogisticsConfig>={}):void {
+    this.config=logisticsConfig(config);
+    for(const f of this.facilities.values())f.state=this.newState(this.zones.get(hexKey(f.center))!.type);
+  }
+  place(h:Hex,type:ZoneType,available=Infinity,shape:DistrictFootprintType=defaultFootprint(type),direction=0):number {
+    if(!forms[type].includes(shape))throw new Error('Этот размер недоступен для выбранного здания');
+    const tiles=facilityFootprint(h,shape,direction),map=this.terrain?.(),base=map?.height(h)??0;
+    let cost=0;
+    for(const tile of tiles) {
+      if(this.occupiedBy.has(hexKey(tile)) || this.graph.get({...tile,level:'ground'}) || this.graph.get({...tile,level:'elevated'}))throw new Error('Площадка занята зданием или дорогой');
+      if(map&&!map.get(tile))throw new Error('Площадка выходит за пределы региона');
+      if(map?.get(tile)?.biome==='water')throw new Error('Предприятие нельзя разместить на воде');
+      const elevation=map?.height(tile)??base;
+      if(!Number.isFinite(elevation)||Math.abs(elevation-base)>6)throw new Error('Перепад площадки превышает 6 м');
+      for(const other of tiles)if(distance(tile,other)===1&&Math.abs(elevation-(map?.height(other)??base))>6)throw new Error('Перепад соседних ячеек превышает 6 м');
+      if(Math.abs(elevation-base)>1e-8)cost+=150;
     }
-    this.revision++;
-    this.syncNetwork();
-    return cost;
-  }
-  remove(h: Hex): string | undefined {
-    const key = hexKey(h);
-    let survivor: string | undefined;
-    for (const [a, b] of this.pairs)
-      if (a === key || b === key) {
-        survivor = a === key ? b : a;
-        this.pairs.delete(a);
-        const z = this.zones.get(survivor);
-        if (z) {
-          z.progress = 0;
-          const cluster = this.clusterAt(survivor);
-          z.accessEdge = cluster?.externalEdges.find(e => hexKey(e.tile) === survivor && e.road)?.edge;
-        }
-        break;
-      }
-    this.zones.delete(key);
-    this.revision++;
-    this.syncNetwork();
-    return survivor;
-  }
-  get clusters(): DistrictCluster[] {
-    const pending = new Set(this.zones.keys()), clusters: DistrictCluster[] = [];
-    while (pending.size) {
-      const id = pending.values().next().value!;
-      const first = this.zones.get(id)!, tiles: Zone[] = [], queue = [first];
-      pending.delete(id);
-      const mate = this.pairs.get(id);
-      if (mate && pending.has(mate)) {
-        queue.push(this.zones.get(mate)!);
-        pending.delete(mate);
-      }
-      while (queue.length) {
-        const z = queue.shift()!;
-        tiles.push(z);
-        for (let e = 0;e < 6;e++) {
-          const k = hexKey(neighbor(z, e)), other = this.zones.get(k);
-          if (first.type !== "Factory" && first.type !== "Warehouse" && pending.has(k) && other?.type === first.type) {
-            pending.delete(k);
-            queue.push(other);
-          }
-        }
-      }
-      const progress = tiles.reduce((s, z) => s + z.progress, 0);
-      const duo = !!mate;
-      const externalEdges: DistrictEdge[] = [];
-      let sharedEdge: DistrictEdge | undefined;
-      for (const tile of tiles)
-        for (let edge = 0;edge < 6;edge++) {
-          const n = neighbor(tile, edge);
-          if (tiles.some(t => hexKey(t) === hexKey(n))) {
-            if (hexKey(tile) === id)
-              sharedEdge = { tile, edge };
-            continue;
-          }
-          const road = this.graph.get({ ...n, level: "ground" });
-          externalEdges.push({ tile, edge, road: road && !road.rampId ? { ...n, level: "ground" } : undefined });
-        }
-      const ports: DistrictCluster["ports"] = {};
-      if (duo) {
-        const a = hexToWorld(first.q, first.r), b = hexToWorld(tiles.find(t => hexKey(t) === mate)!.q, tiles.find(t => hexKey(t) === mate)!.r);
-        const front = { x: -(b.z - a.z) / HEX_STEP, z: (b.x - a.x) / HEX_STEP };
-        const score = (e: DistrictEdge) => {
-          const p = hexToWorld(e.tile.q, e.tile.r), n = hexToWorld(neighbor(e.tile, e.edge).q, neighbor(e.tile, e.edge).r);
-          return ((n.x - p.x) * front.x + (n.z - p.z) * front.z) / HEX_STEP;
-        };
-        const candidates = externalEdges.filter(e => e.road);
-        const sign = candidates.reduce((s, e) => s + score(e), 0) < -1e-6 ? -1 : 1;
-        const ins = candidates.filter(e => hexKey(e.tile) === id), outs = candidates.filter(e => hexKey(e.tile) === mate);
-        const pairs = ins.flatMap(input => outs.map(output => ({ input, output })))
-          .filter(p => distance(p.input.road!, p.output.road!) !== 1)
-          .sort((a, b) => {
-            const rank = (p: typeof a) => sign * (score(p.input) + score(p.output)) + 0.15 * distance(p.input.road!, p.output.road!);
-            return rank(b) - rank(a);
-          });
-        const pair = pairs[0];
-        if (pair) {
-          ports.IN = { ...pair.input, road: pair.input.road!, role: "IN" };
-          ports.OUT = { ...pair.output, road: pair.output.road!, role: "OUT" };
-        }
-      }
-      clusters.push({
-        shape: duo ? "duo" : "single", sharedEdge: duo ? sharedEdge : undefined, externalEdges, ports,
-        id,
-        type: first.type,
-        tiles,
-        progress,
-        level: duo ? 2 : 1 + Math.floor(Math.sqrt(progress / 12)),
-      });
+    if(available<cost)throw new Error(`Недостаточно средств для планировки (+${cost} Cr)`);
+    const id=`facility-${++this.serial}`;
+    const facility={id,center:{...h},tiles,footprint:shape,direction,type:type.toLowerCase(),state:this.newState(type)} as DistrictFacility;
+    if(shape!=='single') {
+      const external=this.externalEdges(tiles);
+      const axis=hexToWorld(neighbor({q:0,r:0},direction).q,neighbor({q:0,r:0},direction).r);
+      const projection=(e:DistrictEdge)=>{const n=neighbor(e.tile,e.edge),p=hexToWorld(e.tile.q+n.q,e.tile.r+n.r);return p.x*axis.x+p.z*axis.z;};
+      const input=external.filter(e=>e.edge===(direction+3)%6).sort((a,b)=>projection(a)-projection(b))[0];
+      const output=external.filter(e=>e.edge===direction).sort((a,b)=>projection(b)-projection(a))[0];
+      facility.inGate={hex:{...input.tile},edge:input.edge};facility.outGate={hex:{...output.tile},edge:output.edge};
     }
-    return clusters;
+    this.facilities.set(id,facility);
+    for(const tile of tiles){const key=hexKey(tile);this.occupiedBy.set(key,id);this.zones.set(key,{...tile,type,progress:0,facilityId:id});if(map)map.get(tile)!.occupiedBy=id;}
+    if(shape!=='single')map?.flatten(tiles,base);
+    this.revision++;this.syncNetwork();return cost;
   }
-  position(h: Hex) { return hexToWorld(h.q, h.r, this.terrain?.().height(h) ?? 0); }
-  syncNetwork(): void {
-    const lanes: DirectedLane[] = [], ports: {
-      nodeId: string;
-      edge: number;
-    }[] = [];
-    for (const c of this.clusters) {
-      if (c.shape === "single" && (c.type === "Factory" || c.type === "Warehouse")) {
-        const zone = c.tiles[0], available = c.externalEdges.filter(e => e.road);
-        if (!available.some(e => e.edge === zone.accessEdge))
-          zone.accessEdge = available[0]?.edge;
-      }
-      if (c.shape !== "duo")
-        continue;
-      const network = serviceNetwork(c, this.graph, this.terrain?.().height(c.tiles[0]) ?? 0);
-      lanes.push(...network.lanes);
-      ports.push(...network.ports);
+  remove(h:Hex):DistrictFacility|undefined {
+    const f=this.facilityAt(h);if(!f)return;
+    this.facilities.delete(f.id);
+    for(const t of f.tiles){const key=hexKey(t);this.zones.delete(key);this.occupiedBy.delete(key);const tile=this.terrain?.().get(t);if(tile)delete tile.occupiedBy;}
+    this.revision++;this.syncNetwork();this.onFacilityRemoved?.(f);return f;
+  }
+  facilityAt(h:Hex|string):DistrictFacility|undefined {
+    const key=typeof h==='string'?h:hexKey(h);
+    return this.facilities.get(key)??this.facilities.get(this.occupiedBy.get(key)??'');
+  }
+  private externalEdges(tiles:Hex[]):DistrictEdge[] {
+    const members=new Set(tiles.map(hexKey)),result:DistrictEdge[]=[];
+    for(const tile of tiles)for(let edge=0;edge<6;edge++){
+      const n=neighbor(tile,edge);if(members.has(hexKey(n)))continue;
+      const road=this.graph.get({...n,level:'ground'});
+      result.push({tile,edge,road:road&&!road.rampId?{...n,level:'ground'}:undefined});
     }
-    this.graph.setServiceNetwork(lanes, ports);
+    return result;
   }
-  private endpoints(h: Hex, role: "IN" | "OUT"): DirectedLane[] {
-    const c = this.clusterAt(h);
-    if (!c)
-      return [];
-    if (c.shape === "duo") {
-      if (!c.ports.IN || !c.ports.OUT)
-        return [];
-      return [...this.graph.lanes.values()].filter(l => l.serviceId === c.id &&
-        (role === "OUT" ? l.id === `yard:${c.id}:OUT` : l.servicePart === "connector" && l.inEdge >= 0 && l.outEdge === -1));
+  get clusters():DistrictCluster[] {
+    return [...this.facilities.values()].map(f=>{
+      const tiles=f.tiles.map(t=>this.zones.get(hexKey(t))!),externalEdges=this.externalEdges(f.tiles);
+      const port=(gate:FacilityGate|undefined,role:'IN'|'OUT'):AccessPort|undefined=>{
+        if(!gate)return;const e=externalEdges.find(e=>hexKey(e.tile)===hexKey(gate.hex)&&e.edge===gate.edge);
+        return e?.road?{...e,role,road:e.road}:undefined;
+      };
+      const progress=tiles.reduce((sum,t)=>sum+t.progress,0);
+      return {id:f.id,type:tiles[0].type,shape:f.footprint,center:f.center,direction:f.direction,tiles,progress,level:f.footprint==='single'?1+Math.floor(Math.sqrt(progress/12)):f.footprint==='triad_3'?2:3,externalEdges,ports:{IN:port(f.inGate,'IN'),OUT:port(f.outGate,'OUT')}};
+    });
+  }
+  clusterAt(h:Hex|string):DistrictCluster|undefined {const f=this.facilityAt(h);return f?this.clusters.find(c=>c.id===f.id):undefined;}
+  position(h:Hex){return hexToWorld(h.q,h.r,this.terrain?.().height(h)??0);}
+  syncNetwork():void {
+    const lanes:DirectedLane[]=[],ports:{nodeId:string;edge:number}[]=[];
+    for(const c of this.clusters){
+      if(c.shape==='single')continue;
+      const network=serviceNetwork(c,this.graph,this.terrain?.().height(c.center)??0);lanes.push(...network.lanes);ports.push(...network.ports);
     }
-    return this.access(h).flatMap(a => this.graph.lanesAt(a).filter(l => !l.serviceId && (role === "OUT" ? l.inEdge === -1 : l.outEdge === -1)));
+    this.graph.setServiceNetwork(lanes,ports);
   }
-  routeTrip(source: Hex, destination: Hex, entry?: DirectedLane): DirectedLane[] {
-    const from = this.clusterAt(source), to = this.clusterAt(destination);
-    if (!to || (!entry && !from))
-      return [];
-    const allowed = new Set([from?.id, to.id].filter((id): id is string => !!id));
-    if (entry?.serviceId)
-      allowed.add(entry.serviceId);
-    return this.graph.routeLanes(entry ? [entry] : this.endpoints(source, "OUT"), this.endpoints(destination, "IN").map(l => l.id), allowed);
+  access(h:Hex,role:'IN'|'OUT'='IN'):RoadAddress[]{
+    const c=this.clusterAt(h);if(!c)return [];
+    if(c.shape!=='single')return c.ports[role]?[c.ports[role]!.road]:[];
+    return c.externalEdges.filter(e=>e.road).map(e=>e.road!);
   }
-  clusterAt(h: Hex | string): DistrictCluster | undefined {
-    const key = typeof h === "string" ? h : hexKey(h);
-    return this.clusters.find(c => c.tiles.some(t => hexKey(t) === key));
-  }
-  access(h: Hex, role?: "IN" | "OUT"): RoadAddress[] {
-    const cluster = this.clusterAt(h);
-    if (cluster?.shape === "duo") {
-      const port = cluster.ports[role ?? "IN"];
-      return port ? [port.road] : [];
+  private endpoints(h:Hex,role:'IN'|'OUT'):DirectedLane[]{
+    const c=this.clusterAt(h);if(!c)return [];
+    if(c.shape!=='single'){
+      if(!c.ports.IN||!c.ports.OUT)return [];
+      return [...this.graph.lanes.values()].filter(l=>l.serviceId===c.id&&(role==='OUT'?l.id===`yard:${c.id}:OUT`:l.servicePart==='connector'&&l.inEdge>=0&&l.outEdge===-1));
     }
-    const result: RoadAddress[] = [];
-    for (let e = 0;e < 6;e++) {
-      const a = { ...neighbor(h, e), level: "ground" as const };
-      const road = this.graph.get(a);
-      if (road && !road.rampId) {
-        const zone = this.zones.get(hexKey(h));
-        if (zone?.accessEdge === e)
-          result.unshift(a);
-        else
-          result.push(a);
-      }
-    }
-    const type = this.zones.get(hexKey(h))?.type;
-    return type === "Factory" || type === "Warehouse" ? result.slice(0, 1) : result;
+    return this.access(h).flatMap(a=>this.graph.lanesAt(a).filter(l=>!l.serviceId&&(role==='OUT'?l.inEdge===-1:l.outEdge===-1)));
   }
-  deliver(key: string): void {
-    const z = this.zones.get(key);
-    if (z)
-      z.progress++;
+  routeTrip(source:Hex,destination:Hex,entry?:DirectedLane):DirectedLane[]{
+    const from=this.clusterAt(source),to=this.clusterAt(destination);if(!to||(!entry&&!from))return [];
+    const allowed=new Set([from?.id,to.id].filter((id):id is string=>!!id));if(entry?.serviceId)allowed.add(entry.serviceId);
+    return this.graph.routeLanes(entry?[entry]:this.endpoints(source,'OUT'),this.endpoints(destination,'IN').map(l=>l.id),allowed);
   }
+  deliver(key:string):void {const f=this.facilityAt(key),z=f&&this.zones.get(hexKey(f.center));if(z)z.progress++;}
 }

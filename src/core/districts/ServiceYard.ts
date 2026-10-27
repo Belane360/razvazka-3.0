@@ -21,16 +21,11 @@ export interface ComplexLayout {
   };
 }
 export function complexLayout(c: DistrictCluster, elevation: number): ComplexLayout {
-  const a = hexToWorld(c.tiles[0].q, c.tiles[0].r), b = hexToWorld(c.tiles[1].q, c.tiles[1].r);
-  const axis = { x: (b.x - a.x) / HEX_STEP, z: (b.z - a.z) / HEX_STEP };
-  const center = { x: (a.x + b.x) / 2, y: elevation, z: (a.z + b.z) / 2 };
-  const f = { x: -axis.z, z: axis.x };
-  const score = Object.values(c.ports).reduce((s, p) => {
-    const r = hexToWorld(p.road.q, p.road.r), t = hexToWorld(p.tile.q, p.tile.r);
-    return s + (r.x - t.x) * f.x + (r.z - t.z) * f.z;
-  }, 0);
-  const sign = score < -1e-6 ? -1 : 1;
-  const front = { x: f.x * sign, z: f.z * sign };
+  const points=c.tiles.map(t=>hexToWorld(t.q,t.r));
+  const center={x:points.reduce((s,p)=>s+p.x,0)/points.length,y:elevation,z:points.reduce((s,p)=>s+p.z,0)/points.length};
+  const angle=c.direction*Math.PI/3;
+  const axis={x:Math.cos(angle),z:Math.sin(angle)},front={x:-axis.z,z:axis.x};
+
   return {
     center, axis, front,
     point: (x, z) => ({ x: center.x + axis.x * x + front.x * z, y: elevation, z: center.z + axis.z * x + front.z * z }),
@@ -104,15 +99,12 @@ export function serviceNetwork(c: DistrictCluster, graph: HexRoadGraph, elevatio
       lanes.push(lane);
     }
   }
-  const approach = (gate: Vec3, side: number): Vec3[] => {
-    const local = layout.local(gate);
-    // A rear gate wraps around the outside end, never through the building.
-    if (local.z < 1)
-      return [gate, layout.point(side * 14, -5.5), layout.point(side * 14, 3.5), layout.point(side * 8.3, 3.5)];
-    return [gate, layout.point(side * 8.3, 3.5)];
-  };
-  const incoming = approach(gates.IN!, -1), outgoing = approach(gates.OUT!, 1).reverse();
-  const service = layout.point(0, 3.5);
+  const large=c.shape==='superhex_7';
+  const approach=(gate:Vec3,side:number):Vec3[]=>large
+    ? [gate,layout.point(side*23,layout.local(gate).z),layout.point(side*21,3),layout.point(side*16,6),layout.point(side*14,11)]
+    : [gate,layout.point(side*11,layout.local(gate).z),layout.point(side*11,1),layout.point(side*4,7)];
+  const incoming=approach(gates.IN!,-1),outgoing=approach(gates.OUT!,1).reverse();
+  const service=layout.point(0,large?11:7);
   lanes.push({ ...pathGeometry([...incoming, service]), id: inId, nodeId: yardId, inEdge: 0, outEdge: 1, nextLanes: [outId], serviceId: id, servicePart: 'yard', speedLimit: 4 });
   lanes.push({ ...pathGeometry([service, ...outgoing]), id: outId, nodeId: yardId, inEdge: 1, outEdge: 2, nextLanes: exits, serviceId: id, servicePart: 'yard', speedLimit: 4 });
   return { lanes, ports };

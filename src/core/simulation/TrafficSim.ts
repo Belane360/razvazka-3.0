@@ -1,10 +1,16 @@
 import { hexKey } from "../hex/HexCoords.ts";
 import type { Hex } from "../hex/HexCoords.ts";
-import type { DistrictManager, DistrictCluster } from "../districts/DistrictManager.ts";
+import type { DistrictManager } from "../districts/DistrictManager.ts";
 import { HexRoadGraph } from "../roads/HexRoadGraph.ts";
 import type { DirectedLane } from "../roads/HexRoadGraph.ts";
 import { CAR, TRUCK, idm } from "./idm.ts";
+import { updateLogisticsTick } from "./Logistics.ts";
+import { logisticsConfig } from "../districts/types.ts";
+import type { LogisticsConfig, DistrictFacility } from "../districts/types.ts";
+export { updateLogisticsTick } from "./Logistics.ts";
 export interface Vehicle {
+  shipment?: { sourceId: string; destinationId: string; payload: number };
+
   id: number;
   kind: "car" | "truck";
   route: DirectedLane[];
@@ -29,9 +35,14 @@ export class TrafficSim {
   private graph: HexRoadGraph;
   private districts?: DistrictManager;
   onDelivery?: (destination: string | undefined, reward: number) => void;
-  constructor(graph: HexRoadGraph, districts?: DistrictManager) {
+  config: LogisticsConfig;
+  constructor(graph: HexRoadGraph, districts?: DistrictManager, config: Partial<LogisticsConfig> = {}) {
     this.graph = graph;
     this.districts = districts;
+    this.config = logisticsConfig(config);
+    districts?.resetLogistics(this.config);
+    if (districts) districts.onFacilityRemoved = f => this.cancelFacility(f);
+
   }
   spawn(
     route: DirectedLane[],
@@ -69,28 +80,48 @@ export class TrafficSim {
       v.source = { q: source.q, r: source.r };
     return v;
   }
-  degradeDistrict(old: DistrictCluster, survivor: string): void {
-    const member = (key: string | undefined) => old.tiles.some(t => hexKey(t) === key);
-    const zone = this.districts!.zones.get(survivor)!;
-    for (const v of this.vehicles) {
-      if (member(v.destination))
-        v.destination = survivor;
-      if (v.source && member(hexKey(v.source)))
-        v.source = { q: zone.q, r: zone.r };
-      // A removed yard cannot retain a live vehicle reference to its lanes.
-      // Vehicles already in the yard resume from the surviving building's access.
-      const lane = v.route[v.laneIndex];
-      if (lane?.serviceId === old.id || (v.parkedAt && member(hexKey(v.parkedAt)))) {
-        v.parkedAt = { q: zone.q, r: zone.r };
-        v.source ??= v.parkedAt;
-        v.route = [];
-        v.laneIndex = 0;
-        v.u = 0;
-        v.speed = 0;
-        v.reroutePending = true;
-      }
+  reset(config: Partial<LogisticsConfig> = {}): void {
+    this.config = logisticsConfig(config);
+    this.vehicles = [];
+    this.waiting.clear();
+    this.time = this.income = this.deliveries = this.serial = 0;
+    this.graphRevision = -1;
+    this.districts?.resetLogistics(this.config);
+  }
+  private settle(v: Vehicle, delivered: boolean): void {
+    const shipment = v.shipment;
+    if (!shipment) return;
+    v.shipment = undefined;
+    const source = this.districts?.facilities.get(shipment.sourceId);
+    const target = this.districts?.facilities.get(shipment.destinationId);
+    const payload = shipment.payload;
+    if (source?.type === "warehouse") {
+      source.state.reservedStock = Math.max(0, source.state.reservedStock - payload);
+      if (delivered) source.state.stock -= payload;
+    } else if (!delivered && source?.type === "factory") {
+      source.state.productionBuffer = Math.min(source.state.bufferLimit, source.state.productionBuffer + payload);
     }
-    this.reconcileRoutes();
+    if (target?.type === "shop") {
+      target.state.inFlightTrucks = Math.max(0, target.state.inFlightTrucks - 1);
+      if (delivered) target.state.stock = Math.min(target.state.maxStock, target.state.stock + payload);
+    } else if (target?.type === "warehouse") {
+      target.state.incomingTrucks = Math.max(0, target.state.incomingTrucks - 1);
+      if (delivered) target.state.stock = Math.min(target.state.capacity, target.state.stock + payload);
+    }
+  }
+  private cancelWhere(predicate: (v: Vehicle) => boolean): void {
+    this.vehicles = this.vehicles.filter(v => {
+      if (!predicate(v)) return true;
+      this.settle(v, false);
+      this.waiting.delete(v.id);
+      return false;
+    });
+  }
+  private cancelFacility(f: DistrictFacility): void {
+    const keys = new Set(f.tiles.map(hexKey));
+    this.cancelWhere(v => v.shipment?.sourceId === f.id || v.shipment?.destinationId === f.id ||
+      !!v.destination && keys.has(v.destination) || !!v.source && keys.has(hexKey(v.source)) ||
+      v.route.some(l => l.serviceId === f.id));
   }
   reconcileRoutes(): void {
     if (!this.districts)
@@ -119,7 +150,7 @@ export class TrafficSim {
         v.parkedAt = undefined;
         v.reroutePending = false;
       }
-      const old = v.route[v.laneIndex], current = this.graph.lanes.get(old.id);
+      const old = v.route[v.laneIndex], current = old && this.graph.lanes.get(old.id);
       if (!current) {
         v.reroutePending = true;
         v.speed = 0;
@@ -137,11 +168,7 @@ export class TrafficSim {
       }
     }
   }
-  cancelDestination(destination: string): void {
-    for (const v of this.vehicles)
-      if (v.destination === destination) this.waiting.delete(v.id);
-    this.vehicles = this.vehicles.filter((v) => v.destination !== destination);
-  }
+  cancelDestination(destination: string): void { this.cancelWhere(v => v.destination === destination); }
   sample(v: Vehicle) {
     if (v.parkedAt)
       return { position: this.districts!.position(v.parkedAt), tangent: { x: 1, y: 0, z: 0 }, grade: 0 };
@@ -203,9 +230,17 @@ export class TrafficSim {
       this.conflictCache.clear();
       this.reconcileRoutes();
     }
-    this.vehicles = this.vehicles.filter((v) =>
-      v.reroutePending || v.route.slice(v.laneIndex).every((l) => this.graph.lanes.has(l.id)),
-    );
+    this.cancelWhere(v => !!v.shipment && !!v.reroutePending ||
+      !v.reroutePending && !v.route.slice(v.laneIndex).every(l => this.graph.lanes.has(l.id)));
+    if (this.districts) updateLogisticsTick(dt, [...this.districts.facilities.values()], this.config,
+      (from, to, payload) => {
+        if (this.vehicles.length >= 80) return false;
+        const v = this.spawnTrip(from.center, to.center, "truck");
+        if (!v) return false;
+        v.shipment = { sourceId: from.id, destinationId: to.id, payload };
+        return true;
+      });
+
     if (changed)
       for (const v of this.vehicles) {
         if (v.source || v.reroutePending) continue;
@@ -381,6 +416,7 @@ export class TrafficSim {
         v.u -= v.route[v.laneIndex].length;
         v.laneIndex++;
         if (v.laneIndex === v.route.length) {
+          this.settle(v, true);
           const reward = v.kind === "truck" ? 32 : 12;
           this.deliveries++;
           this.income += reward;

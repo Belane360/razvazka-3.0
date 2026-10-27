@@ -10,6 +10,7 @@ import { HEIGHT_UNIT } from "./HeightUnits.ts";
 import type { Hex } from "./HexCoords.ts";
 export type Biome = "valley" | "plateau" | "water" | "forest";
 export interface Tile extends Hex {
+  occupiedBy?: string;
   elevation: number;
   biome: Biome;
 }

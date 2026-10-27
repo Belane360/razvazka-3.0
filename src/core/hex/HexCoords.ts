@@ -86,3 +86,5 @@ export function hexLine(a: Hex, b: Hex): Hex[] {
     ),
   );
 }
+
+export function neighbors(h: Hex): Hex[] { return DIRECTIONS.map((_,edge)=>neighbor(h,edge)); }
