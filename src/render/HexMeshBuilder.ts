@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import {
+  hexKey,
   HEX_SIZE,
   HEX_STEP,
   hexToWorld,
@@ -8,6 +9,8 @@ import {
 import type { GameState } from "../core/GameState.ts";
 import type { RoadCell } from "../core/roads/HexRoadGraph.ts";
 import { edgeDirection, laneGeometry } from "../core/roads/geometry.ts";
+import { complexLayout } from "../core/districts/ServiceYard.ts";
+import type { DistrictCluster } from "../core/districts/DistrictManager.ts";
 import type { Zone } from "../core/districts/DistrictManager.ts";
 export const PALETTE = {
   grass: 0x5cd68d,
@@ -126,7 +129,7 @@ function drape(
       triangle(ab, bc, ca, depth + 1);
     } else for (const [x, z] of [a, b, c]) out.push(x, height(x, z), z);
   };
-  for (let i = 0; i < (idx?.count ?? pos.count); i += 3)
+  for (let i = 0;i < (idx?.count ?? pos.count);i += 3)
     triangle(
       vertex(idx ? idx.getX(i) : i),
       vertex(idx ? idx.getX(i + 1) : i + 1),
@@ -148,6 +151,9 @@ export class HexMeshBuilder {
     this.pickables.length = 0;
     this.signals.length = 0;
     const treePositions: THREE.Vector3[] = [];
+    const clusters = game.districts.clusters;
+    const duos = new Map<string, DistrictCluster>();
+    for (const c of clusters) if (c.shape === "duo") for (const t of c.tiles) duos.set(hexKey(t), c);
     for (const t of game.map.tiles.values()) {
       const p = hexToWorld(t.q, t.r, game.map.height(t));
       const water = t.biome === "water";
@@ -183,15 +189,15 @@ export class HexMeshBuilder {
         }
       };
       const subdivisions = 10;
-      for (let edge = 0; edge < 6; edge++) {
+      for (let edge = 0;edge < 6;edge++) {
         const a = ((edge + 0.5) * Math.PI) / 3,
           b = ((edge + 1.5) * Math.PI) / 3;
         const point = (i: number, j: number) => [
           p.x + (HEX_SIZE * (i * Math.cos(a) + j * Math.cos(b))) / subdivisions,
           p.z + (HEX_SIZE * (i * Math.sin(a) + j * Math.sin(b))) / subdivisions,
         ];
-        for (let i = 0; i < subdivisions; i++)
-          for (let j = 0; j < subdivisions - i; j++) {
+        for (let i = 0;i < subdivisions;i++)
+          for (let j = 0;j < subdivisions - i;j++) {
             emit([point(i, j), point(i, j + 1), point(i + 1, j)]);
             if (i + j < subdivisions - 1)
               emit([point(i + 1, j), point(i, j + 1), point(i + 1, j + 1)]);
@@ -213,8 +219,11 @@ export class HexMeshBuilder {
       this.root.add(cap);
       this.pickables.push(cap);
       const outline: number[] = [];
-      for (let e = 0; e < 6; e++)
-        for (let i = 0; i < 10; i++)
+      for (let e = 0;e < 6;e++) {
+        // Outline index e spans the actual neighbor edge e+1.
+        const c = duos.get(hexKey(t));
+        if (c && c === duos.get(hexKey(neighbor(t, (e + 1) % 6)))) continue;
+        for (let i = 0;i < 10;i++)
           for (const u of [i / 10, (i + 1) / 10]) {
             const a = ((e + 0.5) * Math.PI) / 3,
               b = ((e + 1.5) * Math.PI) / 3,
@@ -222,26 +231,28 @@ export class HexMeshBuilder {
               z = p.z + HEX_SIZE * ((1 - u) * Math.sin(a) + u * Math.sin(b));
             outline.push(x, Math.max(0, game.terrainAt(t, x, z)) + 0.025, z);
           }
+      }
       const lines = new THREE.BufferGeometry();
       lines.setAttribute(
         "position",
         new THREE.Float32BufferAttribute(outline, 3),
       );
-      this.root.add(new THREE.LineSegments(lines, gridMaterial));
+      const grid = new THREE.LineSegments(lines, gridMaterial);
+      grid.name = `grid:${hexKey(t)}`;
+      this.root.add(grid);
 
       // Only the region perimeter needs a retaining wall down to the sea bed.
-      for (let edge = 0; edge < 6; edge++) {
+      for (let edge = 0;edge < 6;edge++) {
         const adjacent = game.map.get(neighbor(t, edge));
-        if (
-          adjacent &&
-          (!game.map.isCliff(t, edge) ||
-            game.map.height(t) <= game.map.height(adjacent))
-        )
-          continue;
+        const engineered = game.map.flattened.has(hexKey(t));
+        const sameComplex = duos.has(hexKey(t)) && duos.get(hexKey(t)) === duos.get(hexKey(neighbor(t, edge)));
+        if (sameComplex) continue;
+        if (!engineered && adjacent &&
+          (game.map.flattened.has(hexKey(adjacent)) || !game.map.isCliff(t, edge) || game.map.height(t) <= game.map.height(adjacent))) continue;
         const side: number[] = [];
         const a = ((edge - 0.5) * Math.PI) / 3,
           b = ((edge + 0.5) * Math.PI) / 3;
-        for (let i = 0; i < 10; i++) {
+        for (let i = 0;i < 10;i++) {
           const at = (u: number) => [
             p.x + HEX_SIZE * ((1 - u) * Math.cos(a) + u * Math.cos(b)),
             p.z + HEX_SIZE * ((1 - u) * Math.sin(a) + u * Math.sin(b)),
@@ -280,7 +291,11 @@ export class HexMeshBuilder {
         const g = new THREE.BufferGeometry();
         g.setAttribute("position", new THREE.Float32BufferAttribute(side, 3));
         g.computeVertexNormals();
-        const wall = new THREE.Mesh(g, material(0x81715c));
+        if (engineered && side.every((_, i) => i % 18 !== 1 || Math.abs(side[i] - side[i + 6]) < 1e-5)) { g.dispose(); continue; }
+        const wallMaterial = material(engineered ? PALETTE.concrete : 0x81715c);
+        if (engineered) wallMaterial.side = THREE.DoubleSide;
+        const wall = new THREE.Mesh(g, wallMaterial);
+        if (engineered) wall.name = `retaining:${hexKey(t)}:${edge}`;
         wall.castShadow = true;
         wall.receiveShadow = true;
         wall.userData.hex = t;
@@ -291,7 +306,7 @@ export class HexMeshBuilder {
         !game.roads.get({ ...t, level: "elevated" }) &&
         !game.districts.zones.has(`${t.q},${t.r}`);
       if (vacant && t.biome === "forest")
-        for (let i = 0; i < 3; i++)
+        for (let i = 0;i < 3;i++)
           treePositions.push(
             new THREE.Vector3(
               p.x + (i - 1) * 3,
@@ -300,7 +315,7 @@ export class HexMeshBuilder {
             ),
           );
       if (water && !paper) {
-        for (let i = 0; i < 2; i++)
+        for (let i = 0;i < 2;i++)
           box(
             this.root,
             3,
@@ -333,9 +348,14 @@ export class HexMeshBuilder {
     crowns.castShadow = true;
     trunks.castShadow = true;
     this.root.add(trunks, crowns);
-    for (const n of game.roads.nodes.values()) this.road(game, n, paper);
+    for (const n of game.roads.nodes.values()) {
+      // Service access is painted separately as a single directed lane.
+      const connectionsMask = game.roads.streetEdges(n.id).reduce((mask, e) => mask | (1 << e), 0);
+      this.road(game, { ...n, connectionsMask }, paper);
+    }
     for (const z of game.districts.zones.values())
-      this.building(game, z, paper);
+      if (!duos.has(hexKey(z))) this.building(game, z, paper);
+    for (const c of clusters) if (c.shape === "duo") this.complex(game, c, paper);
   }
   private deckBody(top: THREE.BufferGeometry): void {
     const pos = top.getAttribute("position"),
@@ -344,11 +364,11 @@ export class HexMeshBuilder {
       edges = new Map<string, { a: number[]; b: number[]; count: number }>();
     const point = (i: number) => [pos.getX(i), pos.getY(i), pos.getZ(i)];
     const key = (p: number[]) => p.map((v) => Math.round(v * 10000)).join(",");
-    for (let i = 0; i < (idx?.count ?? pos.count); i += 3) {
+    for (let i = 0;i < (idx?.count ?? pos.count);i += 3) {
       const tri = [0, 1, 2].map((k) => point(idx ? idx.getX(i + k) : i + k));
       for (const p of [tri[2], tri[1], tri[0]])
         vertices.push(p[0], p[1] - 0.45, p[2]);
-      for (let k = 0; k < 3; k++) {
+      for (let k = 0;k < 3;k++) {
         const a = tri[k],
           b = tri[(k + 1) % 3],
           id = [key(a), key(b)].sort().join("|"),
@@ -389,7 +409,7 @@ export class HexMeshBuilder {
     // A radial fan and fixed-width straight arms avoid polygon boolean operations.
     const hub = new THREE.BufferGeometry(),
       verts: number[] = [];
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0;i < 12;i++) {
       const a = (i * Math.PI) / 6,
         b = ((i + 1) * Math.PI) / 6;
       for (const [x, z] of [
@@ -406,14 +426,14 @@ export class HexMeshBuilder {
     center.castShadow = true;
     this.root.add(center);
     if (n.level === "elevated") this.deckBody(center.geometry);
-    for (let e = 0; e < 6; e++)
+    for (let e = 0;e < 6;e++)
       if (n.connectionsMask & (1 << e)) {
         const d = edgeDirection(e),
           side = { x: -d.z, z: d.x };
         const positions: number[] = [],
           indices: number[] = [];
         const segments = n.rampId ? 16 : 1;
-        for (let i = 0; i <= segments; i++) {
+        for (let i = 0;i <= segments;i++) {
           const u = ((HEX_STEP / 2) * i) / segments;
           for (const sign of [-1, 1]) {
             const x = p.x + d.x * u + side.x * 3.1 * sign,
@@ -421,7 +441,7 @@ export class HexMeshBuilder {
             positions.push(x, height(x, z), z);
           }
         }
-        for (let i = 0; i < segments; i++) {
+        for (let i = 0;i < segments;i++) {
           const a = i * 2;
           indices.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
         }
@@ -437,7 +457,7 @@ export class HexMeshBuilder {
         road.castShadow = true;
         this.root.add(road);
         if (n.level === "elevated") this.deckBody(road.geometry);
-        for (let u = 4; u < HEX_STEP / 2; u += 2.4) {
+        for (let u = 4;u < HEX_STEP / 2;u += 2.4) {
           const x = p.x + d.x * u,
             z = p.z + d.z * u;
           const mark = box(
@@ -454,7 +474,7 @@ export class HexMeshBuilder {
         }
         if (!isJunction)
           for (const sign of [-1, 1])
-            for (let i = 0; i < 4; i++) {
+            for (let i = 0;i < 4;i++) {
               const u = 3.7 + ((HEX_STEP / 2 - 3.7) * (i + 0.5)) / 4,
                 len = (HEX_STEP / 2 - 3.7) / 4 + 0.02,
                 x = p.x + d.x * u + side.x * 3.3 * sign,
@@ -477,10 +497,10 @@ export class HexMeshBuilder {
                   p.x + d.x * u1 + side.x * 3.3 * sign,
                   p.z + d.z * u1 + side.z * 3.3 * sign,
                 ) -
-                  height(
-                    p.x + d.x * u0 + side.x * 3.3 * sign,
-                    p.z + d.z * u0 + side.z * 3.3 * sign,
-                  ),
+                height(
+                  p.x + d.x * u0 + side.x * 3.3 * sign,
+                  p.z + d.z * u0 + side.z * 3.3 * sign,
+                ),
                 len,
               );
             }
@@ -503,13 +523,13 @@ export class HexMeshBuilder {
     if (n.level === "elevated") {
       const ground = game.roads.get({ ...n, level: "ground" });
       let count = 0;
-      for (let i = 0; i < 6 && count < 2; i++) {
+      for (let i = 0;i < 6 && count < 2;i++) {
         const a = Math.PI / 6 + (i * Math.PI) / 3,
           x = p.x + 6.5 * Math.cos(a),
           z = p.z + 6.5 * Math.sin(a);
         let clear = true;
         if (ground)
-          for (let e = 0; e < 6; e++)
+          for (let e = 0;e < 6;e++)
             if (ground.connectionsMask & (1 << e)) {
               const d = edgeDirection(e);
               if (
@@ -584,14 +604,14 @@ export class HexMeshBuilder {
       const positions: number[] = [],
         indices: number[] = [],
         steps = Math.max(2, Math.ceil((end - start) / 0.6));
-      for (let i = 0; i <= steps; i++) {
+      for (let i = 0;i <= steps;i++) {
         const u = start + ((end - start) * i) / steps;
         for (const side of [left, right]) {
           const p = at(u, side, raise);
           positions.push(p.x, p.y, p.z);
         }
       }
-      for (let i = 0; i < steps; i++) {
+      for (let i = 0;i < steps;i++) {
         const a = i * 2;
         indices.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
       }
@@ -615,7 +635,7 @@ export class HexMeshBuilder {
     if (edges.length === 1) {
       const c = hexToWorld(n.q, n.r),
         vertices: number[] = [];
-      for (let i = 0; i < 48; i++)
+      for (let i = 0;i < 48;i++)
         for (const a of [null, ((i + 1) * Math.PI) / 24, (i * Math.PI) / 24]) {
           const x = c.x + (a === null ? 0 : 3.3 * Math.cos(a)),
             z = c.z + (a === null ? 0 : 3.3 * Math.sin(a));
@@ -647,7 +667,7 @@ export class HexMeshBuilder {
       rail.castShadow = true;
       this.root.add(rail);
     }
-    for (let u = 0.6; u < curve.length - 0.6; u += 3.5)
+    for (let u = 0.6;u < curve.length - 0.6;u += 3.5)
       this.root.add(
         new THREE.Mesh(
           ribbon(u, Math.min(u + 1.5, curve.length - 0.3), -0.09, 0.09, 0.035),
@@ -698,6 +718,113 @@ export class HexMeshBuilder {
         this.signals.push({ mesh: light, nodeId: n.id, edge: e });
       }
   }
+  private complex(game: GameState, cluster: DistrictCluster, paper: boolean): void {
+    const elevation = game.map.height(cluster.tiles[0]);
+    const layout = complexLayout(cluster, elevation);
+    const group = new THREE.Group();
+    group.name = `complex:${cluster.id}`;
+    group.position.set(layout.center.x, elevation, layout.center.z);
+    group.rotation.y = -Math.atan2(layout.axis.z, layout.axis.x);
+    group.scale.z = layout.axis.x * layout.front.z - layout.axis.z * layout.front.x;
+    this.root.add(group);
+    const pavement: number[] = [];
+    for (const t of cluster.tiles) {
+      const center = hexToWorld(t.q, t.r);
+      for (let e = 0;e < 6;e++) {
+        const a = (e + 0.5) * Math.PI / 3, b = (e + 1.5) * Math.PI / 3;
+        pavement.push(center.x, elevation + 0.16, center.z, center.x + HEX_SIZE * Math.cos(b), elevation + 0.16, center.z + HEX_SIZE * Math.sin(b), center.x + HEX_SIZE * Math.cos(a), elevation + 0.16, center.z + HEX_SIZE * Math.sin(a));
+      }
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(pavement, 3));
+    geometry.computeVertexNormals();
+    const apron = new THREE.Mesh(geometry, material(paper ? 0xb8b4a9 : PALETTE.asphalt));
+    apron.name = `apron:${cluster.id}`;
+    apron.receiveShadow = true;
+    this.root.add(apron);
+    const warehouse = cluster.type === "Warehouse";
+    box(group, 24, 4.5, 5, 0, 2.5, -1.9, warehouse ? 0xe5ae62 : PALETTE.concrete);
+    if (warehouse) {
+      // Two continuous roof planes, with standing seams running across their slope.
+      for (const side of [-1, 1]) {
+        const roof = box(group, 24.7, 0.18, 2.85, 0, 5.05, -1.9 + side * 1.35, PALETTE.asphalt);
+        roof.rotation.x = side * 0.24;
+        for (let x = -12;x <= 12;x += 1.2) {
+          const seam = box(group, 0.055, 0.09, 2.85, x, 5.17, -1.9 + side * 1.35, 0x666575);
+          seam.rotation.x = side * 0.24;
+        }
+      }
+    }
+    else {
+      for (let i = 0;i < 4;i++) {
+        const shape = new THREE.Shape();
+        shape.moveTo(-3, 0);
+        shape.lineTo(3, 0);
+        shape.lineTo(3, 1.6);
+        shape.closePath();
+        const roof = new THREE.Mesh(new THREE.ExtrudeGeometry(shape, { depth: 5.5, bevelEnabled: false }), material(PALETTE.asphalt));
+        roof.name = `shed:${cluster.id}:${i}`;
+        roof.position.set(-9 + i * 6, 4.7, -4.65);
+        roof.castShadow = true;
+        group.add(roof);
+      }
+      for (const x of [-2.1, 0, 2.1]) {
+        cylinder(group, 0.48, 0.65, 5.4, x, 7, -3, 0xb86544, 8);
+        cylinder(group, 0.57, 0.57, 0.45, x, 9.7, -3, PALETTE.paper, 8);
+      }
+    }
+    for (let i = 0;i < 4;i++) {
+      const x = -9 + i * 6;
+      const dock = box(group, 2.6, 2.9, 0.18, x, 1.75, 0.64, 0x272d31);
+      dock.name = `dock:${cluster.id}:${i}`;
+      box(group, 2.95, 0.22, 1.1, x, 0.4, 1, PALETTE.concrete);
+      for (const dx of [-1.55, 1.55])
+        box(group, 0.13, 0.035, 2, x + dx, 0.265, 1.7, PALETTE.mark);
+      box(group, 1.25, 0.85, 1.15, x + 2, 0.7, -4.9, 0xb88a52);
+    }
+    for (const x of [-7, 0, 7]) {
+      // Painted arrows make the direction of the service yard visible.
+      box(group, 1.4, 0.025, 0.12, x, 0.275, 3.5, PALETTE.mark);
+      for (const sign of [-1, 1]) {
+        const arrow = box(group, 0.65, 0.025, 0.12, x + 0.55, 0.275, 3.5 + sign * 0.2, PALETTE.mark);
+        arrow.rotation.y = sign * 0.65;
+      }
+    }
+    // Draw the very same sampled access paths that the simulator uses.
+    for (const lane of game.roads.lanes.values())
+      if (lane.serviceId === cluster.id) {
+        const verts: number[] = [], indices: number[] = [];
+        const count = Math.max(8, Math.ceil(lane.length / 0.5));
+        for (let i = 0;i <= count;i++) {
+          const s = lane.sample(lane.length * i / count), n = Math.hypot(s.tangent.x, s.tangent.z) || 1;
+          for (const side of [-1, 1])
+            verts.push(s.position.x - s.tangent.z / n * 1.5 * side, s.position.y + 0.18, s.position.z + s.tangent.x / n * 1.5 * side);
+          if (i < count) {
+            const k = i * 2;
+            indices.push(k, k + 1, k + 2, k + 1, k + 3, k + 2);
+          }
+        }
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
+        geo.setIndex(indices);
+        geo.computeVertexNormals();
+        const strip = new THREE.Mesh(geo, material(PALETTE.asphalt));
+        strip.name = `service:${lane.id}`;
+        strip.receiveShadow = true;
+        this.root.add(strip);
+        if (lane.servicePart === "connector" && (lane.inEdge === -1 || lane.outEdge === -1)) {
+          const sample = lane.sample(lane.length * 0.65), arrow = new THREE.Group();
+          arrow.position.set(sample.position.x, sample.position.y + 0.22, sample.position.z);
+          arrow.rotation.y = Math.atan2(sample.tangent.x, sample.tangent.z);
+          box(arrow, 0.13, 0.025, 1.3, 0, 0, 0, PALETTE.mark);
+          for (const sign of [-1, 1]) {
+            const head = box(arrow, 0.13, 0.025, 0.65, sign * 0.2, 0, 0.4, PALETTE.mark);
+            head.rotation.y = -sign * 0.7;
+          }
+          this.root.add(arrow);
+        }
+      }
+  }
   private building(game: GameState, z: Zone, paper: boolean): void {
     const p = hexToWorld(z.q, z.r, game.map.height(z));
     const footprint = Array.from({ length: 24 }, (_, i) =>
@@ -710,6 +837,7 @@ export class HexMeshBuilder {
       top = Math.max(p.y, ...footprint);
     p.y = top;
     const group = new THREE.Group();
+    group.name = `building:${hexKey(z)}`;
     group.position.set(p.x, p.y, p.z);
     this.root.add(group);
     const depth = top - bottom + 0.25;
@@ -780,11 +908,11 @@ export class HexMeshBuilder {
       box(group, 7, 4 + Math.min(level, 3), 5, 0, 2.5, 0, 0xeedcb9);
       box(group, 7.5, 0.5, 5.5, 0, 5.2, 0, 0x3aafa9);
       box(group, 5, 2, 0.15, 0, 2, 2.6, 0x96c8d8);
-      for (let i = 0; i < 6; i++)
+      for (let i = 0;i < 6;i++)
         box(group, 1, 0.25, 1.5, -2.5 + i, 3.5, 3, i % 2 ? 0xf4f4f0 : 0xe06d3b);
     } else if (z.type === "Factory") {
       box(group, 7, 4, 5, 0, 2, 0, 0xc5c6b6);
-      for (let i = 0; i < 3; i++) {
+      for (let i = 0;i < 3;i++) {
         const roof = box(group, 2.3, 1.1, 5, -2.3 + i * 2.3, 4.3, 0, 0x4a475c);
         roof.rotation.z = -0.25;
       }
@@ -798,7 +926,7 @@ export class HexMeshBuilder {
       box(group, 7.6, 0.5, 5.6, 0, 4.2, 0, 0x4a475c);
       for (const x of [-2, 1.5])
         box(group, 2.3, 2.5, 0.15, x, 1.4, 2.55, 0xc5c6b6);
-      for (let i = 0; i < 3; i++)
+      for (let i = 0;i < 3;i++)
         box(group, 1.5, 1.5, 1.5, -3 + i * 1.8, 0.75, 4.2, 0xe06d3b);
     }
   }

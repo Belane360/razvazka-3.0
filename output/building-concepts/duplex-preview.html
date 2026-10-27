@@ -1,0 +1,14 @@
+<!doctype html><html lang="ru"><meta charset="utf-8"><title>Развязка — проверка мультигексов</title><style>html,body{margin:0;background:#d9dfc8;font:16px system-ui;color:#232d2a}canvas{display:block;width:100vw;height:100vh}header{position:absolute;top:20px;left:24px;padding:12px 18px;background:#eef0dfdd;border-radius:6px}h1{font-size:21px;margin:0 0 6px}p{margin:0;font-size:14px}</style><header><h1>Развязка · мультигексовые комплексы</h1><p>Склад: разнесённые IN / OUT · Завод: общий дорожный гекс</p></header><script type="module">
+import * as THREE from '/node_modules/three/build/three.module.js';
+import {GameState} from '/src/core/GameState.ts';
+import {HexMeshBuilder} from '/src/render/HexMeshBuilder.ts';
+const game=new GameState();game.speed=0;
+for(const z of [...game.districts.zones.values()])game.districts.remove(z);
+for(const [q,r,type] of [[2,4,'Warehouse'],[3,4,'Warehouse'],[-3,5,'Factory'],[-2,5,'Factory']])game.build({q,r},type,'ground',0,3);
+const paths=[[[1,5],[1,6],[1,7]],[[3,5],[3,6],[3,7]],[[-3,6],[-3,7],[-2,7],[-1,7],[0,7],[1,7],[2,7],[3,7]]];
+for(const path of paths)for(let i=0;i<path.length;i++){const [q,r]=path[i];game.build({q,r},'road','ground',0,3,i?{q:path[i-1][0],r:path[i-1][1]}:undefined);}
+const scene=new THREE.Scene(),builder=new HexMeshBuilder();builder.build(game);scene.add(builder.root);
+scene.add(new THREE.HemisphereLight(0xffefd9,0x8c997b,1.8));const sun=new THREE.DirectionalLight(0xffe2bb,2.2);sun.position.set(-80,150,75);scene.add(sun);
+const renderer=new THREE.WebGLRenderer({antialias:true});renderer.setPixelRatio(devicePixelRatio);renderer.setSize(innerWidth,innerHeight);renderer.setClearColor(0xd9dfc8);document.body.append(renderer.domElement);
+const aspect=innerWidth/innerHeight,half=Math.max(50,72/aspect),camera=new THREE.OrthographicCamera(-half*aspect,half*aspect,half,-half,0.1,1000);camera.position.set(38,115,175);camera.lookAt(38,0,65);renderer.render(scene,camera);
+</script></html>

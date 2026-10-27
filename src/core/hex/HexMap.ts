@@ -22,6 +22,7 @@ export class HexMap {
   readonly tiles = new Map<string, Tile>();
   readonly seaLevel = 0;
   readonly seed: number;
+  readonly flattened = new Set<string>();
   private corners = new Map<string, number>();
   private heights = new Map<string, number>();
   constructor(radius = 14, seed = 23) {
@@ -74,6 +75,13 @@ export class HexMap {
     const raw = 4 + (hills - 4) * blend - (hills + 3) * river * blend;
     return raw > 10 ? 4 + Math.round((raw - 4) / 8) * 8 : raw;
   }
+  flatten(tiles: Hex[], elevation: number): void {
+    for (const h of tiles) {
+      const t = this.get(h);
+      if (t) { t.elevation = elevation; this.flattened.add(hexKey(h)); }
+    }
+    this.corners.clear();
+  }
   isCliff(h: Hex, edge: number): boolean {
     return (
       Math.abs(this.height(h) - this.height(neighbor(h, edge))) > HEIGHT_UNIT
@@ -105,6 +113,7 @@ export class HexMap {
   }
   /** Tile-local sampling retains two different lips along a cliff face. */
   tileSurfaceAt(h: Hex, x: number, z: number): number {
+    if (this.flattened.has(hexKey(h))) return this.height(h);
     const c = hexToWorld(h.q, h.r),
       dx = x - c.x,
       dz = z - c.z,

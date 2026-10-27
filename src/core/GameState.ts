@@ -24,8 +24,8 @@ export class GameState {
     (x, z) => this.map.roadSurfaceAt(x, z),
     (a, b) => Math.abs(this.map.height(a) - this.map.height(b)) > HEIGHT_UNIT,
   );
-  readonly districts = new DistrictManager(this.roads);
-  readonly sim = new TrafficSim(this.roads);
+  readonly districts = new DistrictManager(this.roads, () => this.map);
+  readonly sim = new TrafficSim(this.roads, this.districts);
   budget = 16000;
   speed = 1;
   revision = 0;
@@ -37,7 +37,7 @@ export class GameState {
     this.map = new HexMap(14, seed);
     const path = (cells: Hex[], level: Level = "ground") => {
       for (const h of cells) this.roads.addRoad({ ...h, level });
-      for (let i = 1; i < cells.length; i++)
+      for (let i = 1;i < cells.length;i++)
         this.roads.connect({ ...cells[i - 1], level }, { ...cells[i], level });
     };
     path(Array.from({ length: 13 }, (_, i) => ({ q: i - 6, r: 0 })));
@@ -84,7 +84,7 @@ export class GameState {
         this.districts.deliver(destination);
         if (
           cluster &&
-          1 + Math.floor(Math.sqrt((cluster.progress + 1) / 12)) > cluster.level
+          this.districts.clusterAt(destination)?.level !== cluster.level
         )
           this.revision++;
       }
@@ -113,38 +113,26 @@ export class GameState {
     this.earnings = this.earnings.filter((e) => this.sim.time - e.t < 30);
   }
   private dispatch(): void {
-    if (this.sim.vehicles.length >= 80) return;
+    if (this.sim.vehicles.length >= 80)
+      return;
     const zones = [...this.districts.zones.values()];
-    if (zones.length < 2) return;
-    for (let attempt = 0; attempt < zones.length; attempt++) {
+    if (zones.length < 2)
+      return;
+    for (let attempt = 0;attempt < zones.length;attempt++) {
       const source = zones[this.trip++ % zones.length];
-      const targetType =
-        source.type === "Factory"
-          ? "Warehouse"
-          : source.type === "Warehouse"
+      const targetType = source.type === "Factory"
+        ? "Warehouse"
+        : source.type === "Warehouse"
+          ? "Shop"
+          : source.type === "Home"
             ? "Shop"
-            : source.type === "Home"
-              ? "Shop"
-              : "Home";
+            : "Home";
       const targets = zones.filter((z) => z.type === targetType);
-      if (!targets.length) continue;
-      const dest =
-        targets[Math.floor(this.trip / zones.length) % targets.length];
-      for (const from of this.districts.access(source))
-        for (const to of this.districts.access(dest)) {
-          const route = this.roads.route(from, to);
-          if (
-            route.length &&
-            this.sim.spawn(
-              route,
-              source.type === "Factory" || source.type === "Warehouse"
-                ? "truck"
-                : "car",
-              hexKey(dest),
-            )
-          )
-            return;
-        }
+      if (!targets.length)
+        continue;
+      const dest = targets[Math.floor(this.trip / zones.length) % targets.length];
+      if (this.sim.spawnTrip(source, dest, source.type === "Factory" || source.type === "Warehouse" ? "truck" : "car"))
+        return;
     }
   }
   terrainAt(h: Hex, x: number, z: number): number {
@@ -176,6 +164,7 @@ export class GameState {
       if (this.budget < cost)
         throw new Error("Недостаточно средств для светофора");
       this.roads.configureJunction(h, patch);
+      this.sim.reconcileRoutes();
       this.budget -= cost;
       this.revision++;
       this.message = "Правила перекрёстка обновлены";
@@ -228,7 +217,7 @@ export class GameState {
         if (previous && actualLevel === "ground") {
           const a = hexToWorld(previous.q, previous.r),
             b = hexToWorld(h.q, h.r);
-          for (let i = 0; i <= 32; i++)
+          for (let i = 0;i <= 32;i++)
             if (
               this.map.surfaceAt(
                 a.x + ((b.x - a.x) * i) / 32,
@@ -257,7 +246,7 @@ export class GameState {
         if (tile.biome === "water")
           throw new Error("Начало рампы должно находиться на суше");
         let cell = { ...h };
-        for (let i = 0; i <= span; i++) {
+        for (let i = 0;i <= span;i++) {
           if (rampTarget === "ground" && this.map.get(cell)?.biome === "water")
             throw new Error("Наземная рампа не может пересекать воду");
           if (this.districts.zones.has(hexKey(cell)))
@@ -273,14 +262,17 @@ export class GameState {
         if (this.roads.get({ ...h, level }))
           this.roads.removeRoad({ ...h, level });
         else if (level === "ground" && this.districts.zones.has(hexKey(h))) {
-          this.sim.cancelDestination(hexKey(h));
-          this.districts.remove(h);
+          const old = this.districts.clusterAt(h)!;
+          const survivor = this.districts.remove(h);
+          if (survivor) this.sim.degradeDistrict(old, survivor);
+          else this.sim.cancelDestination(hexKey(h));
         } else return false;
       } else {
         if (tile.biome === "water")
           throw new Error("Район нельзя разместить на воде");
-        this.districts.place(h, tool);
+        cost += this.districts.place(h, tool, this.budget - cost);
       }
+      this.sim.reconcileRoutes();
       this.budget -= cost;
       this.revision++;
       this.message =

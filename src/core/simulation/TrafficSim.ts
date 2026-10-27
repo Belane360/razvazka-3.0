@@ -1,3 +1,6 @@
+import { hexKey } from "../hex/HexCoords.ts";
+import type { Hex } from "../hex/HexCoords.ts";
+import type { DistrictManager, DistrictCluster } from "../districts/DistrictManager.ts";
 import { HexRoadGraph } from "../roads/HexRoadGraph.ts";
 import type { DirectedLane } from "../roads/HexRoadGraph.ts";
 import { CAR, TRUCK, idm } from "./idm.ts";
@@ -10,6 +13,9 @@ export interface Vehicle {
   speed: number;
   length: number;
   destination?: string;
+  source?: Hex;
+  reroutePending?: boolean;
+  parkedAt?: Hex;
 }
 export class TrafficSim {
   vehicles: Vehicle[] = [];
@@ -21,9 +27,11 @@ export class TrafficSim {
   private graphRevision = -1;
   private waiting = new Map<number, { lane: string; since: number }>();
   private graph: HexRoadGraph;
+  private districts?: DistrictManager;
   onDelivery?: (destination: string | undefined, reward: number) => void;
-  constructor(graph: HexRoadGraph) {
+  constructor(graph: HexRoadGraph, districts?: DistrictManager) {
     this.graph = graph;
+    this.districts = districts;
   }
   spawn(
     route: DirectedLane[],
@@ -39,7 +47,7 @@ export class TrafficSim {
       return;
     route = route.map((l) => this.graph.lanes.get(l.id)!);
     const first = route[0];
-    if (this.vehicles.some((v) => v.route[v.laneIndex].nodeId === first.nodeId))
+    if (this.vehicles.some((v) => !v.parkedAt && v.route[v.laneIndex].nodeId === first.nodeId))
       return;
     const v: Vehicle = {
       id: ++this.serial,
@@ -54,12 +62,89 @@ export class TrafficSim {
     this.vehicles.push(v);
     return v;
   }
+  spawnTrip(source: Hex, destination: Hex, kind: "car" | "truck"): Vehicle | undefined {
+    const route = this.districts?.routeTrip(source, destination) ?? [];
+    const v = this.spawn(route, kind, hexKey(destination));
+    if (v)
+      v.source = { q: source.q, r: source.r };
+    return v;
+  }
+  degradeDistrict(old: DistrictCluster, survivor: string): void {
+    const member = (key: string | undefined) => old.tiles.some(t => hexKey(t) === key);
+    const zone = this.districts!.zones.get(survivor)!;
+    for (const v of this.vehicles) {
+      if (member(v.destination))
+        v.destination = survivor;
+      if (v.source && member(hexKey(v.source)))
+        v.source = { q: zone.q, r: zone.r };
+      // A removed yard cannot retain a live vehicle reference to its lanes.
+      // Vehicles already in the yard resume from the surviving building's access.
+      const lane = v.route[v.laneIndex];
+      if (lane?.serviceId === old.id || (v.parkedAt && member(hexKey(v.parkedAt)))) {
+        v.parkedAt = { q: zone.q, r: zone.r };
+        v.source ??= v.parkedAt;
+        v.route = [];
+        v.laneIndex = 0;
+        v.u = 0;
+        v.speed = 0;
+        v.reroutePending = true;
+      }
+    }
+    this.reconcileRoutes();
+  }
+  reconcileRoutes(): void {
+    if (!this.districts)
+      return;
+    for (const v of this.vehicles) {
+      if (!v.source || !v.destination)
+        continue;
+      const target = this.districts.zones.get(v.destination);
+      if (!target)
+        continue;
+      if (v.parkedAt) {
+        const at = v.parkedAt;
+        let fresh: DirectedLane[] = [];
+        if (hexKey(at) === v.destination) {
+          const terminal = this.districts.access(at).flatMap(a => this.graph.lanesAt(a)).find(l => !l.serviceId && l.outEdge === -1);
+          if (terminal)
+            fresh = [terminal];
+        }
+        else
+          fresh = this.districts.routeTrip(at, target);
+        if (!fresh.length)
+          continue;
+        v.route = fresh;
+        v.laneIndex = 0;
+        v.u = 0;
+        v.parkedAt = undefined;
+        v.reroutePending = false;
+      }
+      const old = v.route[v.laneIndex], current = this.graph.lanes.get(old.id);
+      if (!current) {
+        v.reroutePending = true;
+        v.speed = 0;
+        continue;
+      }
+      const alternative = this.districts.routeTrip(v.source, target, current);
+      if (alternative.length) {
+        v.u = Math.min(current.length, v.u / old.length * current.length);
+        v.route = [...v.route.slice(0, v.laneIndex), ...alternative];
+        v.reroutePending = false;
+      }
+      else {
+        v.reroutePending = true;
+        v.speed = 0;
+      }
+    }
+  }
   cancelDestination(destination: string): void {
     for (const v of this.vehicles)
       if (v.destination === destination) this.waiting.delete(v.id);
     this.vehicles = this.vehicles.filter((v) => v.destination !== destination);
   }
   sample(v: Vehicle) {
+    if (v.parkedAt)
+      return { position: this.districts!.position(v.parkedAt), tangent: { x: 1, y: 0, z: 0 }, grade: 0 };
     return v.route[v.laneIndex].sample(v.u);
   }
   travelled(v: Vehicle): number {
@@ -70,14 +155,14 @@ export class TrafficSim {
   get freeFlow(): number {
     return this.vehicles.length
       ? this.vehicles.reduce(
-          (s, v) =>
-            s +
-            Math.min(
-              1,
-              v.speed / (v.kind === "truck" ? TRUCK : CAR).desiredSpeed,
-            ),
-          0,
-        ) / this.vehicles.length
+        (s, v) =>
+          s +
+          Math.min(
+            1,
+            v.speed / (v.kind === "truck" ? TRUCK : CAR).desiredSpeed,
+          ),
+        0,
+      ) / this.vehicles.length
       : 1;
   }
   step(dt: number): void {
@@ -97,9 +182,9 @@ export class TrafficSim {
     if (cached !== undefined) return cached;
     // Swept centerline envelopes. Opposing straight lanes are 2.3 m apart,
     // wider than the 2.05 m envelope; crossing/merging paths reserve together.
-    for (let i = 0; i <= 24; i++) {
+    for (let i = 0;i <= 24;i++) {
       const p = a.sample((a.length * i) / 24).position;
-      for (let j = 0; j <= 24; j++) {
+      for (let j = 0;j <= 24;j++) {
         const q = b.sample((b.length * j) / 24).position;
         if (Math.hypot(p.x - q.x, p.z - q.z) < 2.05) {
           this.conflictCache.set(key, true);
@@ -116,12 +201,14 @@ export class TrafficSim {
     if (changed) {
       this.graphRevision = this.graph.revision;
       this.conflictCache.clear();
+      this.reconcileRoutes();
     }
     this.vehicles = this.vehicles.filter((v) =>
-      v.route.slice(v.laneIndex).every((l) => this.graph.lanes.has(l.id)),
+      v.reroutePending || v.route.slice(v.laneIndex).every((l) => this.graph.lanes.has(l.id)),
     );
     if (changed)
       for (const v of this.vehicles) {
+        if (v.source || v.reroutePending) continue;
         const old = v.route[v.laneIndex],
           fraction = v.u / old.length;
         v.route = v.route.map((l, i) =>
@@ -142,7 +229,7 @@ export class TrafficSim {
           }
         }
       }
-    const states = this.vehicles.map((v) => ({ ...v }));
+    const states = this.vehicles.filter(v => !v.parkedAt).map((v) => ({ ...v }));
     const owners = new Map<string, { id: number; lane: DirectedLane }[]>();
     const reserve = (id: number, lane: DirectedLane) => {
       const list = owners.get(lane.nodeId) ?? [];
@@ -170,7 +257,7 @@ export class TrafficSim {
     const present = new Set<number>();
     for (const v of states) {
       let distance = v.route[v.laneIndex].length - v.u;
-      for (let i = v.laneIndex + 1; i < v.route.length && distance <= 18; i++) {
+      for (let i = v.laneIndex + 1;i < v.route.length && distance <= 18;i++) {
         const lane = v.route[i];
         if (controlled(lane.nodeId)) {
           const previous = this.waiting.get(v.id);
@@ -230,11 +317,12 @@ export class TrafficSim {
       );
     }
     for (const v of this.vehicles) {
+      if (v.reroutePending) continue;
       const lane = v.route[v.laneIndex];
       let gap = Infinity,
         leaderSpeed = 0,
         travel = -v.u;
-      for (let i = v.laneIndex; i < v.route.length && travel < 90; i++) {
+      for (let i = v.laneIndex;i < v.route.length && travel < 90;i++) {
         const ahead = v.route[i];
         if (i > v.laneIndex) {
           const blocked =
@@ -301,6 +389,6 @@ export class TrafficSim {
         }
       }
     }
-    this.vehicles = this.vehicles.filter((v) => v.laneIndex < v.route.length);
+    this.vehicles = this.vehicles.filter((v) => v.parkedAt || v.laneIndex < v.route.length);
   }
 }

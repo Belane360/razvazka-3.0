@@ -39,6 +39,9 @@ export interface DirectedLane extends LaneGeometry {
   outEdge: number;
   nextNode?: string;
   speedLimit: number;
+  serviceId?: string;
+  servicePart?: "connector" | "yard";
+  nextLanes?: string[];
 }
 export const nodeKey = (h: RoadAddress): string => `${h.q},${h.r},${h.level}`;
 export const DECK_HEIGHT = HEIGHT_UNIT;
@@ -58,6 +61,39 @@ export class HexRoadGraph {
   private connectionSerial = 0;
   private cliff?: (a: Hex, b: Hex) => boolean;
   revision = 0;
+  onRoadChange?: () => void;
+  private serviceIds = new Set<string>();
+  private streetMasks = new Map<string, number>();
+  setServiceNetwork(lanes: DirectedLane[], ports: {
+    nodeId: string;
+    edge: number;
+  }[]): void {
+    for (const id of this.serviceIds)
+      this.lanes.delete(id);
+    for (const [id, mask] of this.streetMasks) {
+      const n = this.nodes.get(id);
+      if (n)
+        n.connectionsMask = mask;
+    }
+    this.streetMasks.clear();
+    this.serviceIds.clear();
+    for (const p of ports) {
+      const n = this.nodes.get(p.nodeId);
+      if (n) {
+        if (!this.streetMasks.has(n.id))
+          this.streetMasks.set(n.id, n.connectionsMask);
+        n.connectionsMask |= 1 << p.edge;
+      }
+    }
+    for (const l of lanes) {
+      this.lanes.set(l.id, l);
+      this.serviceIds.add(l.id);
+    }
+    this.revision++;
+  }
+  streetEdges(id: string): number[] {
+    return [...(this.links.get(id)?.keys() ?? [])];
+  }
   constructor(
     terrain: (h: Hex) => number = () => 0,
     inside: (h: Hex) => boolean = () => true,
@@ -117,7 +153,7 @@ export class HexRoadGraph {
       const p = this.get(previous);
       if (p?.level === "elevated") return p.height;
     }
-    for (let e = 0; e < 6; e++) {
+    for (let e = 0;e < 6;e++) {
       const n = this.get({ ...neighbor(h, e), level: "elevated" });
       if (n && (!n.rampId || this.ramps.get(n.rampId)?.nodes.at(-1) === n.id))
         return n.height;
@@ -200,7 +236,7 @@ export class HexRoadGraph {
     const length = Math.hypot(bx - ax, bz - az),
       steps = Math.ceil(length / 0.5);
     let previous = height(ax, az);
-    for (let i = 1; i <= steps; i++) {
+    for (let i = 1;i <= steps;i++) {
       const t = i / steps,
         y = height(ax + (bx - ax) * t, az + (bz - az) * t);
       if (
@@ -232,7 +268,7 @@ export class HexRoadGraph {
     this.validateAddress({ ...start, level: targetLevel });
     neighbor(start, direction);
     const path: RoadAddress[] = [{ ...start, level: "ground" }];
-    for (let i = 1; i <= rampSpan; i++)
+    for (let i = 1;i <= rampSpan;i++)
       path.push({ ...neighbor(path[i - 1], direction), level: targetLevel });
     const low = this.terrain(start),
       high =
@@ -243,7 +279,7 @@ export class HexRoadGraph {
       throw new Error("Выберите площадки разной высоты");
     const id = `ramp:${nodeKey(path[0])}:${direction}`;
     if (this.ramps.has(id)) throw new Error("Рампа уже существует");
-    for (let i = 0; i < path.length; i++) {
+    for (let i = 0;i < path.length;i++) {
       const h = path[i],
         existing = this.get(h);
       if (!this.inside(h)) throw new Error("Рампа выходит за регион");
@@ -292,7 +328,7 @@ export class HexRoadGraph {
         p.z + d.z * length,
         (x, z) => this.rampHeight(ramp, x, z),
       );
-      for (let i = 0; i <= rampSpan * 40; i++)
+      for (let i = 0;i <= rampSpan * 40;i++)
         for (const side of [-3.2, 0, 3.2]) {
           const t = i / (rampSpan * 40),
             x = p.x + d.x * length * t - d.z * side,
@@ -300,8 +336,8 @@ export class HexRoadGraph {
           const ground = this.surface
             ? this.surface(x, z)
             : this.terrain(
-                path[Math.min(rampSpan, Math.floor(t * rampSpan + 0.5))],
-              );
+              path[Math.min(rampSpan, Math.floor(t * rampSpan + 0.5))],
+            );
           const y = this.rampHeight(ramp, x, z);
           if (y < ground - 0.01)
             throw new Error(
@@ -311,7 +347,7 @@ export class HexRoadGraph {
       if (high - this.terrain(path[rampSpan]) < MIN_CLEARANCE)
         throw new Error("На выходе недостаточный просвет");
     }
-    for (let i = 0; i < path.length; i++) {
+    for (let i = 0;i < path.length;i++) {
       const h = path[i],
         key = nodeKey(h),
         t = i / rampSpan;
@@ -495,6 +531,7 @@ export class HexRoadGraph {
     return y;
   }
   private rebuild(): void {
+    this.serviceIds.clear(); this.streetMasks.clear();
     this.links.clear();
     this.lanes.clear();
     for (const n of this.nodes.values()) {
@@ -506,7 +543,7 @@ export class HexRoadGraph {
       this.links.get(b)!.set(opposite(e), a);
     };
     for (const n of this.nodes.values())
-      for (let e = 0; e < 6; e++) {
+      for (let e = 0;e < 6;e++) {
         const o = this.get({ ...neighbor(n, e), level: n.level });
         if (!o) continue;
         const allowed = (v: RoadCell, edge: number) => {
@@ -522,7 +559,7 @@ export class HexRoadGraph {
           allowed(n, e) &&
           allowed(o, opposite(e)) &&
           Math.abs(n.height - o.height) <=
-            (this.surface ? HEX_STEP * 0.55 : 0.01)
+          (this.surface ? HEX_STEP * 0.55 : 0.01)
         ) {
           try {
             this.validateConnection(n, o);
@@ -533,7 +570,7 @@ export class HexRoadGraph {
         }
       }
     for (const r of this.ramps.values())
-      for (let i = 1; i < r.nodes.length; i++)
+      for (let i = 1;i < r.nodes.length;i++)
         link(r.nodes[i - 1], r.direction, r.nodes[i]);
     for (const id of this.edgeAge.keys())
       if (!this.nodes.has(id)) {
@@ -596,15 +633,68 @@ export class HexRoadGraph {
       }
     }
     this.revision++;
+    this.onRoadChange?.();
   }
   lanesAt(h: RoadAddress | string): DirectedLane[] {
     const id = typeof h === "string" ? h : nodeKey(h);
     return [...this.lanes.values()].filter((l) => l.nodeId === id);
   }
   successors(l: DirectedLane): DirectedLane[] {
+    if (l.nextLanes) return l.nextLanes.map(id => this.lanes.get(id)).filter((v): v is DirectedLane => !!v);
     return l.nextNode
       ? this.lanesAt(l.nextNode).filter((n) => n.inEdge === opposite(l.outEdge))
       : [];
+  }
+  /** A* over actual lane endpoints. Service yards are available only to their own trips. */
+  /** A* over actual lane endpoints. Service yards are available only to their own trips. */
+  routeLanes(starts: DirectedLane[], targets: string[], allowedServices = new Set<string>()): DirectedLane[] {
+    const goal = new Set(targets), open = new Set<string>(), cost = new Map<string, number>(), prev = new Map<string, string>();
+    const targetPoints = targets.map(id => this.lanes.get(id)).filter((l): l is DirectedLane => !!l).map(l => l.sample(l.length).position);
+    if (!targetPoints.length)
+      return [];
+    for (const l of starts)
+      if (this.lanes.has(l.id)) {
+        open.add(l.id);
+        cost.set(l.id, l.length / 13);
+      }
+    const heuristic = (l: DirectedLane) => {
+      const p = l.sample(l.length).position;
+      return Math.min(...targetPoints.map(t => Math.hypot(p.x - t.x, p.y - t.y, p.z - t.z))) / 13;
+    };
+    while (open.size) {
+      let current = "", best = Infinity;
+      for (const id of open) {
+        const score = cost.get(id)! + heuristic(this.lanes.get(id)!);
+        if (score < best) {
+          best = score;
+          current = id;
+        }
+      }
+      open.delete(current);
+      const lane = this.lanes.get(current)!;
+      if (goal.has(current)) {
+        const path = [lane];
+        let key = current;
+        while (prev.has(key)) {
+          key = prev.get(key)!;
+          path.unshift(this.lanes.get(key)!);
+        }
+        return path;
+      }
+      for (const next of this.successors(lane)) {
+        if (next.serviceId && !allowedServices.has(next.serviceId))
+          continue;
+        if (!this.movementAllowed(next))
+          continue;
+        const score = cost.get(current)! + next.length / 13;
+        if (score < (cost.get(next.id) ?? Infinity)) {
+          cost.set(next.id, score);
+          prev.set(next.id, current);
+          open.add(next.id);
+        }
+      }
+    }
+    return [];
   }
   route(
     from: RoadAddress,
@@ -650,7 +740,7 @@ export class HexRoadGraph {
         return path;
       }
       for (const next of this.successors(lane)) {
-        if (!this.movementAllowed(next)) continue;
+        if (next.serviceId || !this.movementAllowed(next)) continue;
         if (next.outEdge === -1 && next.nodeId !== target) continue;
         const score = cost.get(current)! + next.length / 13;
         if (score < (cost.get(next.id) ?? Infinity)) {
