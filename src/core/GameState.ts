@@ -77,6 +77,7 @@ export class GameState {
       this.districts.place({ q, r }, type);
     path([{q:2,r:0},{q:2,r:-1},{q:2,r:-2},{q:2,r:-3},{q:3,r:-4}]);
     path([{q:6,r:0},{q:6,r:-1},{q:6,r:-2},{q:6,r:-3}]);
+    path([{q:4,r:0},{q:4,r:-1}]);
     this.roads.configureJunction({q:2,r:-3,level:"ground"}, {allowLeft:true});
     this.sim.onDelivery = (destination, reward) => {
       this.budget += reward;

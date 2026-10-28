@@ -1,4 +1,4 @@
-import { hexToWorld, HEX_STEP } from '../hex/HexCoords.ts';
+import { hexToWorld } from '../hex/HexCoords.ts';
 import type { Vec3 } from '../hex/HexCoords.ts';
 import { laneGeometry } from '../roads/geometry.ts';
 import type { LaneGeometry } from '../roads/geometry.ts';
@@ -23,7 +23,7 @@ export interface ComplexLayout {
 export function complexLayout(c: DistrictCluster, elevation: number): ComplexLayout {
   const points=c.tiles.map(t=>hexToWorld(t.q,t.r));
   const center={x:points.reduce((s,p)=>s+p.x,0)/points.length,y:elevation,z:points.reduce((s,p)=>s+p.z,0)/points.length};
-  const angle=c.direction*Math.PI/3;
+  const angle=c.direction*Math.PI/3+(c.shape==='superhex_7'?Math.PI/6:0);
   const axis={x:Math.cos(angle),z:Math.sin(angle)},front={x:-axis.z,z:axis.x};
 
   return {
@@ -101,11 +101,41 @@ export function serviceNetwork(c: DistrictCluster, graph: HexRoadGraph, elevatio
   }
   const large=c.shape==='superhex_7';
   const approach=(gate:Vec3,side:number):Vec3[]=>large
-    ? [gate,layout.point(side*23,layout.local(gate).z),layout.point(side*21,3),layout.point(side*16,6),layout.point(side*14,11)]
+    ? [gate,layout.point(layout.local(gate).x-side*3*Math.sqrt(3)/2,layout.local(gate).z-1.5),layout.point(side*16,9),layout.point(side*8,5)]
     : [gate,layout.point(side*11,layout.local(gate).z),layout.point(side*11,1),layout.point(side*4,7)];
-  const incoming=approach(gates.IN!,-1),outgoing=approach(gates.OUT!,1).reverse();
-  const service=layout.point(0,large?11:7);
-  lanes.push({ ...pathGeometry([...incoming, service]), id: inId, nodeId: yardId, inEdge: 0, outEdge: 1, nextLanes: [outId], serviceId: id, servicePart: 'yard', speedLimit: 4 });
-  lanes.push({ ...pathGeometry([service, ...outgoing]), id: outId, nodeId: yardId, inEdge: 1, outEdge: 2, nextLanes: exits, serviceId: id, servicePart: 'yard', speedLimit: 4 });
+  const incoming=approach(gates.IN!,large?1:-1),outgoing=approach(gates.OUT!,large?-1:1).reverse();
+  const service=layout.point(0,large?3:7);
+  const dockApproach = large ? [layout.point(0,7)] : [];
+  const inboundGeometry=pathGeometry([...incoming,...dockApproach,service]);
+  const serviceStops:NonNullable<DirectedLane['serviceStops']>=[];
+  if(large)serviceStops.push({distance:pathGeometry(incoming.slice(0,3)).length,seconds:1,kind:'waiting'});
+  serviceStops.push({distance:inboundGeometry.length,seconds:3,kind:'dock'});
+  lanes.push({ ...inboundGeometry, reverseFromDistance:large?inboundGeometry.length-4:undefined, serviceStops, id: inId, nodeId: yardId, inEdge: 0, outEdge: 1, nextLanes: [outId], serviceId: id, servicePart: 'yard', speedLimit: 4 });
+  lanes.push({ ...pathGeometry([service, ...dockApproach, ...outgoing]), id: outId, nodeId: yardId, inEdge: 1, outEdge: 2, nextLanes: exits, serviceId: id, servicePart: 'yard', speedLimit: 4 });
+  if(large){
+    // The frontage street is public and bidirectional. Separate connector IDs keep
+    // delivery targets private, so routeTrip cannot skip the dock via the street.
+    for(const reverse of [false,true]){
+      const source=reverse?c.ports.OUT:c.ports.IN,target=reverse?c.ports.IN:c.ports.OUT;
+      const transitId=`${yardId}:TRANSIT:${reverse?1:0}`,exitIds:string[]=[];
+      let start:Vec3|undefined,end:Vec3|undefined;
+      for(const [port,incoming] of [[source,true],[target,false]] as const){
+        const n=graph.get(port.road)!,edge=(port.edge+3)%6;
+        for(const e of [-1,...graph.streetEdges(n.id)]){
+          const geometry=laneGeometry(n,incoming?e:edge,incoming?edge:e,(x,z)=>graph.heightAt(n,x,z));
+          const gate=geometry.sample(incoming?geometry.length:0).position,delta=elevation-gate.y;
+          const connector:DirectedLane={...geometry,id:`${transitId}:${incoming?'ENTER':'EXIT'}:${e}`,nodeId:n.id,
+            inEdge:incoming?e:edge,outEdge:incoming?edge:e,serviceId:id,servicePart:'frontage',publicTransit:true,speedLimit:8,
+            sample(u){const s=geometry.sample(u),t=Math.max(0,Math.min(1,u/geometry.length));s.position.y+=delta*(incoming?t:1-t);s.grade+=delta*(incoming?1:-1)/geometry.length;s.tangent.y=s.grade/Math.sqrt(1+s.grade*s.grade);return s;}};
+          if(incoming){start={...gate,y:elevation};connector.nextLanes=[transitId];}
+          else{end={...gate,y:elevation};connector.nextNode=graph.lanesAt(n.id).find(l=>!l.serviceId&&l.outEdge===e)?.nextNode;exitIds.push(connector.id);}
+          lanes.push(connector);
+        }
+      }
+      const side=reverse?-1:1,z=13.8+(reverse?1.15:-1.15),a=layout.local(start!),b=layout.local(end!);
+      const points=[start!,layout.point(a.x-side*3*Math.sqrt(3)/2,a.z-1.5),layout.point(side*16,z),layout.point(-side*16,z),layout.point(b.x+side*3*Math.sqrt(3)/2,b.z-1.5),end!];
+      lanes.push({...pathGeometry(points),id:transitId,nodeId:`frontage:${id}`,inEdge:reverse?1:0,outEdge:reverse?0:1,nextLanes:exitIds,serviceId:id,servicePart:'frontage',publicTransit:true,speedLimit:8});
+    }
+  }
   return { lanes, ports };
 }

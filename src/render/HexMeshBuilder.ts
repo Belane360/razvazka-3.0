@@ -1,3 +1,5 @@
+import { buildRoadTileMesh } from "./RoadTileMeshes.ts";
+import { createIndustrialComplex } from "./IndustrialComplexMesh.ts";
 import * as THREE from "three";
 import {
   hexKey,
@@ -403,6 +405,19 @@ export class HexMeshBuilder {
     const edges = Array.from({ length: 6 }, (_, e) => e).filter(
       (e) => n.connectionsMask & (1 << e),
     );
+    if (n.level === "ground" && !n.rampId) {
+      this.root.add(buildRoadTileMesh(n, game.roads.roadTile(n), height, asphalt));
+      if (n.signal) for (const e of edges) {
+        const d = edgeDirection(e), x = p.x + d.x * 6 - d.z * 3.7,
+          z = p.z + d.z * 6 + d.x * 3.7, y = height(x,z);
+        box(this.root, .22, 2.8, .22, x, y+1.4, z, PALETTE.ink);
+        box(this.root, .7, 1.2, .7, x, y+3, z, PALETTE.ink);
+        const light = new THREE.Mesh(new THREE.SphereGeometry(.42,10,8), new THREE.MeshBasicMaterial({color:0x45b678}));
+        light.position.set(x,y+3.92,z); this.root.add(light);
+        this.signals.push({mesh:light,nodeId:n.id,edge:e});
+      }
+      return;
+    }
     if (edges.length <= 2) {
       this.curvedRoad(game, n, edges, asphalt);
       return;
@@ -721,6 +736,11 @@ export class HexMeshBuilder {
   }
   private complex(game: RenderState, cluster: DistrictCluster, paper: boolean): void {
     const elevation = game.map.height(cluster.tiles[0]);
+    if (cluster.shape === "superhex_7") {
+      this.root.add(createIndustrialComplex(cluster, elevation));
+      this.servicePaths(game, cluster);
+      return;
+    }
     const layout = complexLayout(cluster, elevation);
     const group = new THREE.Group();
     group.name = `complex:${cluster.id}`;
@@ -744,7 +764,7 @@ export class HexMeshBuilder {
     apron.receiveShadow = true;
     this.root.add(apron);
     const warehouse = cluster.type === "Warehouse", shop = cluster.type === "Shop";
-    const large = cluster.shape === "superhex_7";
+    const large = false;
     const width = large ? 32 : 14, depth = large ? 13 : 7;
     const height = large ? 9 : 6.5, centerZ = large ? -6.5 : -2;
     const front = centerZ + depth / 2;
@@ -804,9 +824,13 @@ export class HexMeshBuilder {
         cylinder(group, 0.18, 0.18, 0.3, x + dx, 1.05, front + 0.6, PALETTE.ink, 8);
       }
     }
+    this.servicePaths(game, cluster);
+  }
+  private servicePaths(game: RenderState, cluster: DistrictCluster): void {
     // Draw the very same sampled access paths that the simulator uses.
     for (const lane of game.roads.lanes.values())
       if (lane.serviceId === cluster.id) {
+        if (cluster.shape === "superhex_7" && (lane.servicePart === "yard" || lane.nodeId.startsWith("frontage:"))) continue;
         const verts: number[] = [], indices: number[] = [];
         const count = Math.max(8, Math.ceil(lane.length / 0.5));
         for (let i = 0;i <= count;i++) {
@@ -831,7 +855,7 @@ export class HexMeshBuilder {
             sample.position.x, sample.position.y + 0.22, sample.position.z, PALETTE.mark);
           mark.rotation.y = Math.atan2(sample.tangent.x, sample.tangent.z);
         }
-        if (lane.servicePart === "yard" || (lane.inEdge === -1 || lane.outEdge === -1)) {
+        if (cluster.shape !== "superhex_7" && (lane.servicePart === "yard" || (lane.inEdge === -1 || lane.outEdge === -1))) {
           const sample = lane.sample(lane.length * 0.65), arrow = new THREE.Group();
           arrow.name = `direction:${lane.id}`;
           arrow.position.set(sample.position.x, sample.position.y + 0.24, sample.position.z);

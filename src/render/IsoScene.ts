@@ -1,4 +1,4 @@
-import { defaultFootprint, facilityFootprint } from "../core/districts/DistrictManager.ts";
+import { defaultFootprint, facilityFootprint, facilityGates } from "../core/districts/DistrictManager.ts";
 import type { ZoneType } from "../core/districts/DistrictManager.ts";
 import type { DistrictFootprintType } from "../core/districts/types.ts";
 import { RISE_PER_STEP } from "../core/hex/HeightUnits.ts";
@@ -309,16 +309,13 @@ export class IsoScene {
       this.ghost.add(m);
     }
     if (building && footprint !== "single") {
-      const angle = this.options.direction * Math.PI / 3;
-      const axis = { x: Math.cos(angle), z: Math.sin(angle) };
+      const selectedGates = facilityGates(this.hover, footprint, this.options.direction);
       for (const input of [true, false]) {
-        const edge = (this.options.direction + (input ? 3 : 0)) % 6;
-        const gates = cells.filter(cell => !cells.some(c => hexKey(c) === hexKey(neighbor(cell, edge))))
-          .map(cell => {
-            const a = hexToWorld(cell.q, cell.r), n = neighbor(cell, edge), b = hexToWorld(n.q, n.r);
-            return { x: (a.x + b.x) / 2, z: (a.z + b.z) / 2 };
-          }).sort((a, b) => (input ? 1 : -1) * ((a.x - b.x) * axis.x + (a.z - b.z) * axis.z));
-        const gate = gates[0];
+        const port = input ? selectedGates.inGate! : selectedGates.outGate!;
+        const a = hexToWorld(port.hex.q, port.hex.r), adjacent = neighbor(port.hex, port.edge),
+          b = hexToWorld(adjacent.q, adjacent.r);
+        const gate = {x:(a.x+b.x)/2,z:(a.z+b.z)/2};
+        const angle = port.edge * Math.PI/3 + (input ? Math.PI : 0);
         const arrow = new THREE.Shape();
         arrow.moveTo(-2.8, -0.7); arrow.lineTo(0, -0.7);
         arrow.lineTo(0, -1.8); arrow.lineTo(3, 0); arrow.lineTo(0, 1.8);

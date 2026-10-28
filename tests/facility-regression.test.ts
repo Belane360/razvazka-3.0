@@ -31,14 +31,14 @@ test('flat triad charges placement only and excessive height rejects the entire 
   assert.equal(g.map.height(tiles[1]),4+delta);
  }
 });
-test('all six orientations retain opposing fixed gates and keep yard paths outside the hall',()=>{
+test('all six orientations retain fixed facade gates and keep yard paths outside the hall',()=>{
  for(const shape of ['triad_3','superhex_7'] as const)for(let direction=0;direction<6;direction++){
   const map=new HexMap(5),roads=new HexRoadGraph(()=>4),d=new DistrictManager(roads,()=>map),h={q:0,r:0};
   d.place(h,shape==='triad_3'?'Warehouse':'Factory',Infinity,shape,direction);
   const f=d.facilityAt(h)!;const gates=structuredClone([f.inGate,f.outGate]);
   for(const cell of ring(h,2))if(!d.facilityAt(cell))roads.addRoad({...cell,level:'ground'});
   for(const gate of [f.inGate!,f.outGate!])roads.addRoad({...neighbor(gate.hex,gate.edge),level:'ground'});
-  assert.equal((f.inGate!.edge+3)%6,f.outGate!.edge);
+  assert.equal((f.inGate!.edge+(shape==='superhex_7'?2:3))%6,f.outGate!.edge);
   const c=d.clusterAt(h)!,layout=complexLayout(c,4),yard=roads.serviceRoute(f.id,'IN','OUT');assert.ok(yard?.length);
   assert.equal(roads.serviceRoute(f.id,'OUT','IN'),null);
   for(const lane of yard!)for(let i=0;i<=100;i++){

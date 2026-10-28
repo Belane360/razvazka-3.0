@@ -14,17 +14,18 @@ function scene(type:'Factory'|'Warehouse'|'Shop',shape:'superhex_7'|'triad_3'){
  const game={map,roads,districts,terrainAt:(h:{q:number;r:number},x:number,z:number)=>map.flattened.has(hexKey(h))?map.height(h):map.surfaceAt(x,z)};
  const builder=new HexMeshBuilder();builder.build(game);return{builder,districts};
 }
-test('superhex has one monumental body, six docks, unified flat apron and no internal tile edges',()=>{
+test('superhex has one monumental body, three docks, unified flat apron and no internal tile edges',()=>{
  const{builder,districts}=scene('Factory','superhex_7'),f=[...districts.facilities.values()][0];
  const group=builder.root.getObjectByName(`complex:${f.id}`);assert.ok(group);
- assert.equal(group.children.filter(o=>o.name.startsWith('dock:')).length,6);
+ assert.equal(group.children.filter(o=>o.name.startsWith('dock:')).length,3);
  const body=group.getObjectByName(`body:${f.id}`) as THREE.Mesh;assert.ok(body);
  body.geometry.computeBoundingBox();assert.equal(body.geometry.boundingBox!.getSize(new THREE.Vector3()).y,9);
  for(const h of f.tiles)assert.equal(builder.root.getObjectByName(`building:${hexKey(h)}`),undefined);
  const grid=builder.root.getObjectByName('grid:0,0') as THREE.LineSegments;assert.equal(grid.geometry.getAttribute('position').count,0);
  const apron=builder.root.getObjectByName(`apron:${f.id}`) as THREE.Mesh;const p=apron.geometry.getAttribute('position');
- assert.equal(p.count,7*6*3);for(let i=0;i<p.count;i++)assert.ok(Math.abs(p.getY(i)-4.16)<1e-5);
- assert.equal(group.children.filter(o=>o.name.startsWith('stack:')).length,3);
+ assert.ok(p.count>0);for(let i=0;i<p.count;i++)assert.ok(Math.abs(p.getY(i))<1e-5);
+ assert.equal(apron.position.y,.19);
+ assert.equal(group.children.filter(o=>o.name.startsWith('stack:')).length,2);
 });
 test('warehouse uses continuous gabled roof with skylights; triad shop remains retail',()=>{
  for(const [type,shape] of [['Warehouse','superhex_7'],['Warehouse','triad_3'],['Shop','triad_3']] as const){

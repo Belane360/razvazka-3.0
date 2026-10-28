@@ -22,6 +22,10 @@ export interface Vehicle {
   source?: Hex;
   reroutePending?: boolean;
   parkedAt?: Hex;
+  /** Service dwell belongs to the trip, so graph rebuilds cannot repeat unloading. */
+  dockWaitRemaining?: number;
+  servicedDockLane?: string;
+  completedServiceStops?: string[];
 }
 export class TrafficSim {
   vehicles: Vehicle[] = [];
@@ -172,7 +176,10 @@ export class TrafficSim {
   sample(v: Vehicle) {
     if (v.parkedAt)
       return { position: this.districts!.position(v.parkedAt), tangent: { x: 1, y: 0, z: 0 }, grade: 0 };
-    return v.route[v.laneIndex].sample(v.u);
+    const lane = v.route[v.laneIndex], sample = lane.sample(v.u);
+    if (lane.reverseFromDistance !== undefined && v.u >= lane.reverseFromDistance && v.kind === "truck")
+      sample.tangent = {x:-sample.tangent.x,y:-sample.tangent.y,z:-sample.tangent.z};
+    return sample;
   }
   travelled(v: Vehicle): number {
     return (
@@ -255,10 +262,8 @@ export class TrafficSim {
             .slice(v.laneIndex + 1)
             .some((l) => !this.graph.movementAllowed(l))
         ) {
-          const current = v.route[v.laneIndex],
-            start = this.graph.nodes.get(current.nodeId)!,
-            target = this.graph.nodes.get(v.route.at(-1)!.nodeId)!;
-          const alternative = this.graph.route(start, target, current);
+          const current = v.route[v.laneIndex];
+          const alternative = this.graph.routeLanes([current], [v.route.at(-1)!.id]);
           if (alternative.length) {
             v.route = [...v.route.slice(0, v.laneIndex), ...alternative];
           }
@@ -354,6 +359,15 @@ export class TrafficSim {
     for (const v of this.vehicles) {
       if (v.reroutePending) continue;
       const lane = v.route[v.laneIndex];
+      if ((v.dockWaitRemaining ?? 0) > 0) {
+        v.dockWaitRemaining = Math.max(0, v.dockWaitRemaining! - dt);
+        v.speed = 0;
+        continue;
+      }
+      const stops = lane.serviceStops ?? (lane.servicePart === "yard" && lane.id.endsWith(":IN")
+        ? [{distance:lane.length,seconds:3,kind:"dock" as const}] : []);
+      const stopIndex = v.kind === "truck" ? stops.findIndex((_,i) => !v.completedServiceStops?.includes(`${lane.id}:${i}`)) : -1;
+      const stop = stops[stopIndex];
       let gap = Infinity,
         leaderSpeed = 0,
         travel = -v.u;
@@ -394,10 +408,22 @@ export class TrafficSim {
         }
         travel += ahead.length;
       }
+      // Yield before entering the shared frontage merge, including cars behind the merge point.
+      if (lane.servicePart === "yard" && lane.id.endsWith(":OUT")) {
+        const approaching = states.some(other => {
+          const l = other.route[other.laneIndex];
+          return other.id !== v.id && l.publicTransit && l.serviceId === lane.serviceId &&
+            l.nodeId.startsWith("frontage:") && l.outEdge === 1 && l.length-other.u < 18;
+        });
+        if (approaching && lane.length-v.u > 4) {
+          gap = Math.min(gap, Math.max(0,lane.length-v.u-5));
+          leaderSpeed = 0;
+        }
+      }
       const params = v.kind === "truck" ? TRUCK : CAR;
       const p = {
         ...params,
-        desiredSpeed: Math.min(params.desiredSpeed, lane.speedLimit),
+        desiredSpeed: Math.min(params.desiredSpeed, lane.speedLimit, stop ? Math.sqrt(3 * Math.max(.05, stop.distance-v.u)) : Infinity),
       };
       const acceleration = idm(
         v.speed,
@@ -412,6 +438,14 @@ export class TrafficSim {
       move = Math.min(move, Math.max(0, gap - 0.1));
       v.speed = move + 1e-8 < (v.speed + speed) * 0.5 * dt ? 0 : speed;
       v.u += move;
+      if (stop && v.u >= stop.distance) {
+        v.u = stop.distance;
+        v.speed = 0;
+        v.dockWaitRemaining = stop.seconds;
+        (v.completedServiceStops ??= []).push(`${lane.id}:${stopIndex}`);
+        if (stop.kind === "dock") v.servicedDockLane = lane.id;
+        continue;
+      }
       while (v.u >= v.route[v.laneIndex].length) {
         v.u -= v.route[v.laneIndex].length;
         v.laneIndex++;

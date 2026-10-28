@@ -26,6 +26,23 @@ export function facilityFootprint(center: Hex, footprint: DistrictFootprintType,
   if(footprint==='superhex_7') return [{...center},...neighbors(center)];
   throw new RangeError('Unknown footprint');
 }
+/** Fixed gates shared by placement and its visual preview. */
+export function facilityGates(center:Hex,shape:DistrictFootprintType,direction=0):{inGate?:FacilityGate;outGate?:FacilityGate} {
+  const tiles=facilityFootprint(center,shape,direction);
+  if(shape==='single')return {};
+  if(shape==='superhex_7'){
+    const inEdge=(direction+1)%6,outEdge=(direction+3)%6;
+    return {inGate:{hex:neighbor(center,inEdge),edge:inEdge},outGate:{hex:neighbor(center,outEdge),edge:outEdge}};
+  }
+  const members=new Set(tiles.map(hexKey));
+  const external:DistrictEdge[]=[];
+  for(const tile of tiles)for(let edge=0;edge<6;edge++)if(!members.has(hexKey(neighbor(tile,edge))))external.push({tile,edge});
+  const axis=hexToWorld(neighbor({q:0,r:0},direction).q,neighbor({q:0,r:0},direction).r);
+  const projection=(e:DistrictEdge)=>{const n=neighbor(e.tile,e.edge),p=hexToWorld(e.tile.q+n.q,e.tile.r+n.r);return p.x*axis.x+p.z*axis.z;};
+  const input=external.filter(e=>e.edge===(direction+3)%6).sort((a,b)=>projection(a)-projection(b))[0];
+  const output=external.filter(e=>e.edge===direction).sort((a,b)=>projection(b)-projection(a))[0];
+  return {inGate:{hex:{...input.tile},edge:input.edge},outGate:{hex:{...output.tile},edge:output.edge}};
+}
 export class DistrictManager {
   readonly zones = new Map<string,Zone>();
   readonly facilities = new Map<string,DistrictFacility>();
@@ -67,14 +84,7 @@ export class DistrictManager {
     if(available<cost)throw new Error(`Недостаточно средств для планировки (+${cost} Cr)`);
     const id=`facility-${++this.serial}`;
     const facility={id,center:{...h},tiles,footprint:shape,direction,type:type.toLowerCase(),state:this.newState(type)} as DistrictFacility;
-    if(shape!=='single') {
-      const external=this.externalEdges(tiles);
-      const axis=hexToWorld(neighbor({q:0,r:0},direction).q,neighbor({q:0,r:0},direction).r);
-      const projection=(e:DistrictEdge)=>{const n=neighbor(e.tile,e.edge),p=hexToWorld(e.tile.q+n.q,e.tile.r+n.r);return p.x*axis.x+p.z*axis.z;};
-      const input=external.filter(e=>e.edge===(direction+3)%6).sort((a,b)=>projection(a)-projection(b))[0];
-      const output=external.filter(e=>e.edge===direction).sort((a,b)=>projection(b)-projection(a))[0];
-      facility.inGate={hex:{...input.tile},edge:input.edge};facility.outGate={hex:{...output.tile},edge:output.edge};
-    }
+    Object.assign(facility,facilityGates(h,shape,direction));
     this.facilities.set(id,facility);
     for(const tile of tiles){const key=hexKey(tile);this.occupiedBy.set(key,id);this.zones.set(key,{...tile,type,progress:0,facilityId:id});if(map)map.get(tile)!.occupiedBy=id;}
     if(shape!=='single')map?.flatten(tiles,base);
@@ -129,7 +139,7 @@ export class DistrictManager {
     const c=this.clusterAt(h);if(!c)return [];
     if(c.shape!=='single'){
       if(!c.ports.IN||!c.ports.OUT)return [];
-      return [...this.graph.lanes.values()].filter(l=>l.serviceId===c.id&&(role==='OUT'?l.id===`yard:${c.id}:OUT`:l.servicePart==='connector'&&l.inEdge>=0&&l.outEdge===-1));
+      return [...this.graph.lanes.values()].filter(l=>l.serviceId===c.id&&!l.publicTransit&&(role==='OUT'?l.id===`yard:${c.id}:OUT`:l.servicePart==='connector'&&l.inEdge>=0&&l.outEdge===-1));
     }
     return this.access(h).flatMap(a=>this.graph.lanesAt(a).filter(l=>!l.serviceId&&(role==='OUT'?l.inEdge===-1:l.outEdge===-1)));
   }

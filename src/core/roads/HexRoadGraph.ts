@@ -1,3 +1,5 @@
+import { roadTileSpec } from './RoadTiles.ts';
+import type { RoadTileDecoration, RoadTileSpec } from './RoadTiles.ts';
 import {
   HEIGHT_UNIT,
   RISE_PER_STEP,
@@ -18,6 +20,8 @@ export interface RoadCell extends RoadAddress {
   id: string;
   type: RoadType;
   connectionsMask: number;
+  tileDecoration?: RoadTileDecoration;
+  pocketSide?: 1 | -1;
   signal: boolean;
   rampId?: string;
   height: number;
@@ -40,7 +44,11 @@ export interface DirectedLane extends LaneGeometry {
   nextNode?: string;
   speedLimit: number;
   serviceId?: string;
-  servicePart?: "connector" | "yard";
+  servicePart?: "connector" | "yard" | "frontage";
+  /** Public street crossing reserved facility land, never a dock shortcut. */
+  publicTransit?: boolean;
+  reverseFromDistance?: number;
+  serviceStops?: {distance:number;seconds:number;kind:"waiting"|"dock"}[];
   nextLanes?: string[];
 }
 export const nodeKey = (h: RoadAddress): string => `${h.q},${h.r},${h.level}`;
@@ -93,6 +101,26 @@ export class HexRoadGraph {
   }
   streetEdges(id: string): number[] {
     return [...(this.links.get(id)?.keys() ?? [])];
+  }
+  /** Open the road surface and curbs at both street links and facility gates. */
+  roadTile(h: RoadAddress): RoadTileSpec {
+    const n = this.get(h);
+    if (!n) throw new Error('Дорожный гекс не найден');
+    const mask = n.connectionsMask;
+    return roadTileSpec(mask, n.tileDecoration, n.pocketSide);
+  }
+  setRoadTile(h: RoadAddress, decoration?: RoadTileDecoration, pocketSide: 1 | -1 = 1): void {
+    const n = this.get(h);
+    if (!n) throw new Error('Дорожный гекс не найден');
+    const spec = this.roadTile(h);
+    if (decoration === 'pocket' && !['straight', 'pocket'].includes(spec.kind))
+      throw new Error('Карман требует двух противоположных подключений');
+    if (decoration === 'decel_ramp' && spec.edges.length !== 3)
+      throw new Error('Раструб требует трёх подключений');
+    n.tileDecoration = decoration;
+    n.pocketSide = pocketSide;
+    this.revision++;
+    this.onRoadChange?.();
   }
   constructor(
     terrain: (h: Hex) => number = () => 0,
@@ -688,7 +716,7 @@ export class HexRoadGraph {
         return path;
       }
       for (const next of this.successors(lane)) {
-        if (next.serviceId && !allowedServices.has(next.serviceId))
+        if (next.serviceId && !next.publicTransit && !allowedServices.has(next.serviceId))
           continue;
         if (!this.movementAllowed(next))
           continue;
@@ -716,13 +744,15 @@ export class HexRoadGraph {
       prev = new Map<string, string>();
     for (const l of entry
       ? [entry]
-      : this.lanesAt(source).filter((l) => l.inEdge === -1)) {
+      : this.lanesAt(source).filter((l) => l.inEdge === -1 && (!l.serviceId || l.publicTransit))) {
       open.add(l.id);
       cost.set(l.id, l.length / 13);
     }
     const heuristic = (id: string) => {
-      const n = this.nodes.get(this.lanes.get(id)!.nodeId)!;
-      return (Math.max(0, distance(n, to) - 1) * HEX_STEP) / 13;
+      const lane=this.lanes.get(id)!;
+      const n = this.nodes.get(lane.nodeId);
+      if(n)return (Math.max(0, distance(n, to) - 1) * HEX_STEP) / 13;
+      return 0; // Virtual frontage lanes have no editable road-cell node.
     };
     while (open.size) {
       let current = "";
@@ -746,7 +776,7 @@ export class HexRoadGraph {
         return path;
       }
       for (const next of this.successors(lane)) {
-        if (next.serviceId || !this.movementAllowed(next)) continue;
+        if ((next.serviceId && !next.publicTransit) || !this.movementAllowed(next)) continue;
         if (next.outEdge === -1 && next.nodeId !== target) continue;
         const score = cost.get(current)! + next.length / 13;
         if (score < (cost.get(next.id) ?? Infinity)) {

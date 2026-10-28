@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Развязка — ателье промышленных зданий</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5eedc;color:#293531;font-family:Arial,Helvetica,sans-serif}canvas{display:block;width:100%;height:100%;touch-action:none}
+header{position:absolute;top:24px;left:30px;pointer-events:none}small{font-size:10px;letter-spacing:3px;color:#78816b;font-weight:bold}h1{font-size:27px;letter-spacing:-1px;margin:8px 0}header p{font-size:12px;color:#7e806f;margin:0}
+.tools{position:absolute;right:26px;top:25px;display:flex;flex-wrap:wrap;gap:6px;max-width:470px;justify-content:flex-end}
+button{font:inherit;font-size:12px;border:1px solid #d3d0bd;border-radius:5px;background:#fffaf0e8;color:#455047;padding:10px 13px;cursor:pointer}
+button:hover{background:#e8e8d4}button:focus-visible{outline:2px solid #327368;outline-offset:3px}button[aria-pressed=true]{background:#304d43;border-color:#304d43;color:#fff8e7}
+.settings{position:absolute;right:28px;top:116px;display:flex;align-items:center;gap:18px;font-size:11px;color:#687462}.settings label{display:flex;align-items:center;gap:6px}input{accent-color:#456c55}input[type=range]{width:84px}
+footer{position:absolute;bottom:25px;left:30px;right:30px}.models{display:flex;gap:8px}.models button{text-align:left;padding:13px 18px;flex:1;max-width:260px}.models strong{display:block;font-size:15px;margin-bottom:5px}.models span{font-size:10px;opacity:.75;letter-spacing:1px}.summary{display:flex;justify-content:space-between;gap:14px;margin-bottom:13px;font-size:11px;color:#69735f}
+#loading{position:absolute;inset:40% 0;text-align:center}#error{position:absolute;inset:30% 15%;background:#fff0e0;padding:24px;display:none;color:#853d2e}
+@media(max-width:800px){header{top:16px;left:16px}h1{font-size:20px}.tools{top:100px;left:16px;right:16px;max-width:none;justify-content:flex-start}.settings{top:192px;left:16px;right:auto}footer{left:16px;right:16px;bottom:16px}.models{gap:4px}.models button{padding:10px 7px}.models strong{font-size:12px}.models span{font-size:8px}.summary span:last-child{display:none}}
+</style>
+</head>
+<body>
+<canvas aria-label="Интерактивная витрина процедурных зданий"></canvas>
+<header><small>РАЗВЯЗКА / ВИЗУАЛЬНАЯ ЛАБОРАТОРИЯ</small><h1>Промышленная архитектура</h1><p>Процедурные диорамы · общий масштаб · без симуляции</p></header>
+<div class="tools">
+<button id="camera">Камера: ортографическая</button><button id="reset">Сбросить вид</button>
+<button id="rotate" aria-pressed="false">Автовращение</button><button id="capture">Сохранить PNG</button>
+</div>
+<div class="settings"><label><input type="checkbox" id="shadows" checked>Тени</label><label>Свет <input type="range" id="exposure" aria-label="Экспозиция" min=".7" max="1.8" value="1.25" step=".05"></label></div>
+<footer>
+<div class="summary"><span id="status"></span><span>ЛКМ — вращение · колесо — масштаб · ПКМ — перемещение</span></div>
+<nav class="models" aria-label="Выбор модели">
+<button data-focus="all" aria-pressed="true"><strong>Вся коллекция</strong><span>01 — 04 / ОБЩИЙ ВИД</span></button>
+<button data-focus="home" aria-pressed="false"><strong>01 / Дом</strong><span>1 ГЕКС · МАСШТАБ</span></button>
+<button data-focus="shop" aria-pressed="false"><strong>02 / Магазин</strong><span>3 ГЕКСА · ТОРГОВЛЯ</span></button>
+<button data-focus="warehouse" aria-pressed="false"><strong>03 / Склад</strong><span>7 ГЕКСОВ · ЛОГИСТИКА</span></button>
+<button data-focus="factory" aria-pressed="false"><strong>04 / Завод</strong><span>7 ГЕКСОВ · ПРОИЗВОДСТВО</span></button>
+</nav>
+</footer>
+<div id="loading">Собираем диорамы…</div><div id="error" role="alert"></div>
+<script>window.addEventListener('error',e=>{const box=document.getElementById('error');box.style.display='block';box.textContent='Не удалось открыть витрину: '+e.message;});</script>
+<!-- PREVIEW_SCRIPT -->
+</body></html>
